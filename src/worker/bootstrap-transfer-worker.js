@@ -27,7 +27,15 @@ async function bootstrapTransferWorker({ ipc, baseDir, updaterConfig = {}, relay
       })
 
       if (updaterWorker.updater?.store && updaterWorker.updater.store !== backend.store) {
-        backend.swarm.on('connection', (socket) => updaterWorker.updater.store.replicate(socket))
+        backend.swarm.on('connection', (socket) => {
+          if (socket && typeof socket.on === 'function') {
+            socket.on('error', (error) => onSwarmSocketError(error))
+          }
+          const replication = updaterWorker.updater.store.replicate(socket)
+          if (replication && typeof replication.on === 'function') {
+            replication.on('error', (error) => onSwarmSocketError(error))
+          }
+        })
       }
 
       const updaterDiscoveryKey = updaterWorker.updater?.drive?.core?.discoveryKey
@@ -136,4 +144,22 @@ function sleep(ms) {
 
 module.exports = {
   bootstrapTransferWorker
+}
+
+function onSwarmSocketError(error) {
+  if (isBenignConnectionError(error)) return
+  console.error('Updater swarm connection error:', error)
+}
+
+function isBenignConnectionError(error) {
+  const code = String(error?.code || '')
+  const message = String(error?.message || '')
+  return (
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ETIMEDOUT' ||
+    message.includes('connection reset by peer') ||
+    message.includes('stream was destroyed') ||
+    message.includes('socket closed')
+  )
 }

@@ -37,7 +37,13 @@ class TransferBackend {
     await this.store.ready()
     const keyPair = await this.store.createKeyPair('peardrops-swarm')
     this.swarm = new Hyperswarm({ keyPair, ...this.swarmOptions })
-    this.swarm.on('connection', (socket) => this.store.replicate(socket))
+    this.swarm.on('connection', (socket) => {
+      attachSocketErrorHandler(socket)
+      const replication = this.store.replicate(socket)
+      if (replication && typeof replication.on === 'function') {
+        replication.on('error', (error) => onBenignConnectionError(error))
+      }
+    })
     this.flockManager = new FlockManager(null, {
       swarm: this.swarm,
       store: this.store
@@ -265,6 +271,7 @@ class TransferBackend {
       dht: this.swarm.dht
     })
     swarm.on('connection', (socket) => {
+      attachSocketErrorHandler(socket)
       this._handleWebTransferSocket(socket, drive).catch(() => {
         socket.destroy()
       })
@@ -383,4 +390,27 @@ function withTimeout(promise, ms, message) {
 
 module.exports = {
   TransferBackend
+}
+
+function attachSocketErrorHandler(socket) {
+  if (!socket || typeof socket.on !== 'function') return
+  socket.on('error', (error) => onBenignConnectionError(error))
+}
+
+function onBenignConnectionError(error) {
+  if (isBenignConnectionError(error)) return
+  console.error('Non-benign swarm connection error:', error)
+}
+
+function isBenignConnectionError(error) {
+  const code = String(error?.code || '')
+  const message = String(error?.message || '')
+  return (
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ETIMEDOUT' ||
+    message.includes('connection reset by peer') ||
+    message.includes('stream was destroyed') ||
+    message.includes('socket closed')
+  )
 }
