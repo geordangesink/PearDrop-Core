@@ -27,6 +27,7 @@ class TransferBackend {
     this.persistence = new HyperdbPersistence(path.join(baseDir, 'db'))
     this.liveDrives = new Map()
     this.liveFlocks = new Map()
+    this.webHosts = new Map()
     this.flockManager = null
   }
 
@@ -79,29 +80,39 @@ class TransferBackend {
 
     this.swarm.join(drive.discoveryKey, { server: true, client: true })
     this.liveDrives.set(drive.key.toString('hex'), drive)
+    const webHost = await this._createWebHostForDrive(drive)
 
     const flock = await this.flockManager.create()
     await flock.set('peardrops/drive-key', drive.key.toString('hex'))
     this.liveFlocks.set(flock.invite, flock)
 
-    const invite = createInvite({
+    const nativeInvite = createInvite({
       driveKey: drive.key.toString('hex'),
       roomInvite: flock.invite,
+      topic: webHost.topicHex,
       relayUrl: this.relayUrl,
       app: 'native'
     })
+    const webSwarmLink = createInvite({
+      topic: webHost.topicHex,
+      relayUrl: this.relayUrl,
+      webKey: webHost.hostPublicKey,
+      app: 'web'
+    }).replace('peardrops://invite', 'peardrops-web://join')
 
     const persisted = await this.persistence.appendTransfer({
       type: 'upload',
       transferId,
-      invite,
+      invite: nativeInvite,
       driveKey: drive.key.toString('hex'),
       fileCount: fileManifest.length,
       totalBytes: fileManifest.reduce((sum, item) => sum + item.byteLength, 0)
     })
 
     return {
-      invite,
+      invite: nativeInvite,
+      nativeInvite,
+      webSwarmLink,
       transfer: persisted,
       manifest: fileManifest
     }
@@ -142,6 +153,23 @@ class TransferBackend {
     return {
       transfer: persisted,
       files: saved
+    }
+  }
+
+  async readEntry({ invite, drivePath }) {
+    if (!drivePath || typeof drivePath !== 'string') {
+      throw new Error('drivePath is required')
+    }
+
+    const { driveKey, roomInvite } = parseInvite(invite)
+    const resolvedDriveKey = await this._resolveDriveKey({ driveKey, roomInvite })
+    const drive = await this._attachDrive(resolvedDriveKey)
+    const data = await this._waitForEntry(drive, drivePath)
+
+    return {
+      drivePath,
+      dataBase64: b4a.toString(data, 'base64'),
+      byteLength: data.byteLength
     }
   }
 
@@ -209,6 +237,11 @@ class TransferBackend {
       await flock.close()
     }
     this.liveFlocks.clear()
+    for (const host of this.webHosts.values()) {
+      await host.discovery.destroy()
+      await host.swarm.destroy()
+    }
+    this.webHosts.clear()
     await this.flockManager?.close()
     for (const drive of this.liveDrives.values()) {
       await drive.close()
@@ -217,6 +250,92 @@ class TransferBackend {
     await this.swarm?.destroy()
     await this.store?.close()
     await this.persistence.close()
+  }
+
+  async _createWebHostForDrive(drive) {
+    const driveKeyHex = drive.key.toString('hex')
+    const topic = deriveWebTopic(drive.discoveryKey)
+    const topicHex = b4a.toString(topic, 'hex')
+
+    if (this.webHosts.has(topicHex)) return { topicHex }
+
+    const keyPair = await this.store.createKeyPair(`peardrops-web-${driveKeyHex}`)
+    const swarm = new Hyperswarm({
+      keyPair,
+      dht: this.swarm.dht
+    })
+    swarm.on('connection', (socket) => {
+      this._handleWebTransferSocket(socket, drive).catch(() => {
+        socket.destroy()
+      })
+    })
+
+    const discovery = swarm.join(topic, { server: true, client: false })
+    await discovery.flushed()
+
+    this.webHosts.set(topicHex, { swarm, discovery, drive })
+    return {
+      topicHex,
+      hostPublicKey: b4a.toString(keyPair.publicKey, 'hex')
+    }
+  }
+
+  async _handleWebTransferSocket(socket, drive) {
+    let buffered = ''
+
+    socket.on('data', async (chunk) => {
+      buffered += b4a.toString(chunk, 'utf8')
+      let newline = buffered.indexOf('\n')
+      while (newline !== -1) {
+        const line = buffered.slice(0, newline).trim()
+        buffered = buffered.slice(newline + 1)
+        if (line) await this._handleWebRequestLine(socket, drive, line)
+        newline = buffered.indexOf('\n')
+      }
+    })
+  }
+
+  async _handleWebRequestLine(socket, drive, line) {
+    let request = null
+    try {
+      request = JSON.parse(line)
+    } catch {
+      return
+    }
+
+    const id = typeof request.id === 'number' ? request.id : 0
+    const send = (payload) => {
+      socket.write(b4a.from(`${JSON.stringify({ id, ...payload })}\n`, 'utf8'))
+    }
+
+    try {
+      if (request.type === 'manifest') {
+        const raw = await this._waitForEntry(drive, '/manifest.json')
+        send({
+          ok: true,
+          manifest: JSON.parse(raw.toString('utf8'))
+        })
+        return
+      }
+
+      if (request.type === 'file') {
+        const drivePath = String(request.path || '')
+        if (!drivePath.startsWith('/files/')) throw new Error('Invalid file path')
+        const data = await this._waitForEntry(drive, drivePath)
+        send({
+          ok: true,
+          dataBase64: b4a.toString(data, 'base64')
+        })
+        return
+      }
+
+      throw new Error('Unknown request type')
+    } catch (error) {
+      send({
+        ok: false,
+        error: error.message || String(error)
+      })
+    }
   }
 }
 
@@ -233,6 +352,13 @@ function sanitizeName(name) {
 
 function randomId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function deriveWebTopic(discoveryKey) {
+  const topic = b4a.from(discoveryKey)
+  topic[0] ^= 0x70
+  topic[1] ^= 0x64
+  return topic
 }
 
 function sleep(ms) {

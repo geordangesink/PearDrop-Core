@@ -101,7 +101,8 @@ async function bootstrapTransferWorker({ ipc, baseDir, updaterConfig = {}, relay
       })),
     [RpcCommand.CREATE_UPLOAD]: async (payload) => guard(() => backend.createUpload(payload)),
     [RpcCommand.GET_MANIFEST]: async (payload) => guard(() => backend.getManifest(payload)),
-    [RpcCommand.DOWNLOAD]: async (payload) => guard(() => backend.download(payload))
+    [RpcCommand.DOWNLOAD]: async (payload) => guard(() => backend.download(payload)),
+    [RpcCommand.READ_ENTRY]: async (payload) => guard(() => backend.readEntry(payload))
   })
 
   return { backend, updaterWorker, close }

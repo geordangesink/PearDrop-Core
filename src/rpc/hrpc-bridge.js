@@ -6,7 +6,8 @@ const RpcCommand = {
   CREATE_UPLOAD: 2,
   GET_MANIFEST: 3,
   DOWNLOAD: 4,
-  SHUTDOWN: 5
+  SHUTDOWN: 5,
+  READ_ENTRY: 6
 }
 
 function createRpcServer(ipc, handlers) {
