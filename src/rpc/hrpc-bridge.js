@@ -11,6 +11,7 @@ const RpcCommand = {
   LIST_ACTIVE_HOSTS: 7,
   STOP_HOST: 8,
   START_HOST_FROM_TRANSFER: 9,
+  READ_ENTRY_CHUNK: 10,
 };
 
 function createRpcServer(ipc, handlers) {

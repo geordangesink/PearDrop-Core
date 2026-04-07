@@ -5,6 +5,7 @@ const { UpdaterWorker } = require("../runtime/updater-worker");
 async function bootstrapTransferWorker({
   ipc,
   baseDir,
+  metadataDir = "",
   updaterConfig = {},
   relayUrl = "",
 }) {
@@ -14,6 +15,7 @@ async function bootstrapTransferWorker({
 
   const backend = new TransferBackend({
     baseDir,
+    metadataDir,
     relayUrl: relayUrl || updaterConfig.relayUrl || "",
   });
 
@@ -124,6 +126,8 @@ async function bootstrapTransferWorker({
       guard(() => backend.download(payload)),
     [RpcCommand.READ_ENTRY]: async (payload) =>
       guard(() => backend.readEntry(payload)),
+    [RpcCommand.READ_ENTRY_CHUNK]: async (payload) =>
+      guard(() => backend.readEntryChunk(payload)),
     [RpcCommand.LIST_ACTIVE_HOSTS]: async () =>
       guard(() => backend.listActiveHosts()),
     [RpcCommand.STOP_HOST]: async (payload) =>
@@ -153,8 +157,17 @@ async function readyBackendWithLockRetry(backend) {
 }
 
 function isStorageLockError(error) {
+  const code = String(error?.code || "");
   const message = String(error?.message || "");
-  return message.includes("File descriptor could not be locked");
+  return (
+    code === "EIO" ||
+    code === "EBUSY" ||
+    code === "EAGAIN" ||
+    message.includes("File descriptor could not be locked") ||
+    (message.includes("LOCK") &&
+      (message.includes("Resource temporarily unavailable") ||
+        message.includes("could not be locked")))
+  );
 }
 
 function sleep(ms) {

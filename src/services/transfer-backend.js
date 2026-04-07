@@ -10,6 +10,7 @@ const { createInvite, parseInvite } = require("../utils/invite");
 class TransferBackend {
   constructor({
     baseDir,
+    metadataDir = "",
     relayUrl = "",
     swarmOptions = {},
     resolveWaitMs = 10000,
@@ -24,7 +25,8 @@ class TransferBackend {
     this.flockJoinWaitMs = flockJoinWaitMs;
     this.store = null;
     this.swarm = null;
-    this.persistence = new HyperdbPersistence(path.join(baseDir, "db"));
+    this.metadataDir = metadataDir || path.join(baseDir, "db");
+    this.persistence = new HyperdbPersistence(this.metadataDir);
     this.liveDrives = new Map();
     this.liveFlocks = new Map();
     this.liveHosts = new Map();
@@ -34,6 +36,7 @@ class TransferBackend {
 
   async ready() {
     await fs.promises.mkdir(this.baseDir, { recursive: true });
+    await fs.promises.mkdir(this.metadataDir, { recursive: true });
     this.store = new Corestore(path.join(this.baseDir, "corestore"));
     await this.store.ready();
     const keyPair = await this.store.createKeyPair("peardrops-swarm");
@@ -72,8 +75,12 @@ class TransferBackend {
     for (const file of files) {
       const name = sanitizeName(file.name || "file.bin");
       const drivePath = `/files/${name}`;
-      const data = file.dataBase64
-        ? b4a.from(file.dataBase64, "base64")
+      const hasInlineData = Object.prototype.hasOwnProperty.call(
+        file,
+        "dataBase64",
+      );
+      const data = hasInlineData
+        ? b4a.from(String(file.dataBase64 || ""), "base64")
         : await fs.promises.readFile(file.path);
 
       await drive.put(drivePath, data);
@@ -154,17 +161,45 @@ class TransferBackend {
     if (!transfer) throw new Error("Transfer not found");
     if (!transfer.driveKey)
       throw new Error("Transfer does not include a drive key");
+    if (!transfer.invite) throw new Error("Transfer does not include an invite");
+
+    if (this.liveHosts.has(transfer.invite)) {
+      const host = this.liveHosts.get(transfer.invite);
+      return {
+        invite: host.invite,
+        nativeInvite: host.invite,
+        webSwarmLink: host.webSwarmLink || "",
+        transfer,
+        manifest: host.fileManifest || [],
+        hostSession: {
+          invite: host.invite,
+          sessionName: host.sessionName || transfer.sessionName || "Host Session",
+          sessionLabel: host.sessionLabel || transfer.sessionLabel || "",
+        },
+      };
+    }
 
     const drive = await this._attachDrive(transfer.driveKey);
     const manifest =
       transfer.manifest ||
       (await this.getManifest({ invite: transfer.invite }));
+    const reusedSessionName =
+      String(transfer.sessionName || "").trim() ||
+      String(sessionName || "").trim() ||
+      "Host Session";
+    const reusedSessionLabel =
+      String(transfer.sessionLabel || "").trim() ||
+      formatHostSessionLabel(reusedSessionName);
 
     return this._startHostingDrive({
       drive,
-      transferId: transfer.transferId || randomId(),
+      transferId: transfer.transferId || transfer.id || randomId(),
       fileManifest: manifest.files || manifest,
-      sessionName,
+      sessionName: reusedSessionName,
+      sessionLabel: reusedSessionLabel,
+      nativeInvite: transfer.invite,
+      persistTransfer: false,
+      existingTransfer: transfer,
     });
   }
 
@@ -236,6 +271,30 @@ class TransferBackend {
     };
   }
 
+  async readEntryChunk({ invite, drivePath, offset = 0, length = 256 * 1024 }) {
+    if (!drivePath || typeof drivePath !== "string") {
+      throw new Error("drivePath is required");
+    }
+
+    const { driveKey, roomInvite } = parseInvite(invite);
+    const resolvedDriveKey = await this._resolveDriveKey({
+      driveKey,
+      roomInvite,
+    });
+    const drive = await this._attachDrive(resolvedDriveKey);
+
+    const safeOffset = Math.max(0, Number(offset || 0));
+    const safeLength = Math.max(1, Math.min(1024 * 1024, Number(length || 0)));
+    const bytes = await readDriveChunk(drive, drivePath, safeOffset, safeLength);
+
+    return {
+      drivePath,
+      offset: safeOffset,
+      byteLength: bytes.byteLength,
+      dataBase64: b4a.toString(bytes, "base64"),
+    };
+  }
+
   async _attachDrive(driveKeyHex) {
     if (this.liveDrives.has(driveKeyHex))
       return this.liveDrives.get(driveKeyHex);
@@ -301,6 +360,10 @@ class TransferBackend {
     transferId,
     fileManifest,
     sessionName = "",
+    sessionLabel = "",
+    nativeInvite = "",
+    persistTransfer = true,
+    existingTransfer = null,
   }) {
     const driveKeyHex = drive.key.toString("hex");
     this.swarm.join(drive.discoveryKey, { server: true, client: true });
@@ -311,13 +374,15 @@ class TransferBackend {
     await flock.set("peardrops/drive-key", driveKeyHex);
     this.liveFlocks.set(flock.invite, flock);
 
-    const nativeInvite = createInvite({
-      driveKey: driveKeyHex,
-      roomInvite: flock.invite,
-      topic: webHost.topicHex,
-      relayUrl: this.relayUrl,
-      app: "native",
-    });
+    const resolvedNativeInvite =
+      String(nativeInvite || "").trim() ||
+      createInvite({
+        driveKey: driveKeyHex,
+        roomInvite: flock.invite,
+        topic: webHost.topicHex,
+        relayUrl: this.relayUrl,
+        app: "native",
+      });
     const webSwarmLink = createInvite({
       topic: webHost.topicHex,
       relayUrl: this.relayUrl,
@@ -326,26 +391,43 @@ class TransferBackend {
     }).replace("peardrops://invite", "peardrops-web://join");
 
     const hostSessionName = String(sessionName || "").trim() || "Host Session";
-    const hostSessionLabel = formatHostSessionLabel(hostSessionName);
+    const hostSessionLabel =
+      String(sessionLabel || "").trim() || formatHostSessionLabel(hostSessionName);
     const createdAt = Date.now();
-    const persisted = await this.persistence.appendTransfer({
-      type: "upload",
-      transferId,
-      invite: nativeInvite,
-      driveKey: driveKeyHex,
-      fileCount: fileManifest.length,
-      totalBytes: fileManifest.reduce(
-        (sum, item) => sum + Number(item.byteLength || 0),
-        0,
-      ),
-      sessionName: hostSessionName,
-      sessionLabel: hostSessionLabel,
-      manifest: fileManifest,
-    });
+    const persisted = persistTransfer
+      ? await this.persistence.appendTransfer({
+          type: "upload",
+          transferId,
+          invite: resolvedNativeInvite,
+          driveKey: driveKeyHex,
+          fileCount: fileManifest.length,
+          totalBytes: fileManifest.reduce(
+            (sum, item) => sum + Number(item.byteLength || 0),
+            0,
+          ),
+          sessionName: hostSessionName,
+          sessionLabel: hostSessionLabel,
+          manifest: fileManifest,
+        })
+      : existingTransfer || {
+          type: "upload",
+          transferId,
+          invite: resolvedNativeInvite,
+          driveKey: driveKeyHex,
+          fileCount: fileManifest.length,
+          totalBytes: fileManifest.reduce(
+            (sum, item) => sum + Number(item.byteLength || 0),
+            0,
+          ),
+          sessionName: hostSessionName,
+          sessionLabel: hostSessionLabel,
+          manifest: fileManifest,
+          createdAt,
+        };
 
-    this.liveHosts.set(nativeInvite, {
+    this.liveHosts.set(resolvedNativeInvite, {
       transferId,
-      invite: nativeInvite,
+      invite: resolvedNativeInvite,
       driveKey: driveKeyHex,
       roomInvite: flock.invite,
       sessionName: hostSessionName,
@@ -354,16 +436,17 @@ class TransferBackend {
       fileManifest,
       flock,
       topicHex: webHost.topicHex,
+      webSwarmLink,
     });
 
     return {
-      invite: nativeInvite,
-      nativeInvite,
+      invite: resolvedNativeInvite,
+      nativeInvite: resolvedNativeInvite,
       webSwarmLink,
       transfer: persisted,
       manifest: fileManifest,
       hostSession: {
-        invite: nativeInvite,
+        invite: resolvedNativeInvite,
         sessionName: hostSessionName,
         sessionLabel: hostSessionLabel,
       },
@@ -478,6 +561,22 @@ class TransferBackend {
         return;
       }
 
+      if (request.type === "file-chunk") {
+        const drivePath = String(request.path || "");
+        if (!drivePath.startsWith("/files/"))
+          throw new Error("Invalid file path");
+        const offset = Math.max(0, Number(request.offset || 0));
+        const length = Math.max(1, Math.min(1024 * 1024, Number(request.length || 0)));
+        const bytes = await readDriveChunk(drive, drivePath, offset, length);
+        send({
+          ok: true,
+          offset,
+          byteLength: bytes.byteLength,
+          dataBase64: b4a.toString(bytes, "base64"),
+        });
+        return;
+      }
+
       throw new Error("Unknown request type");
     } catch (error) {
       send({
@@ -569,4 +668,34 @@ function isBenignConnectionError(error) {
     message.includes("stream was destroyed") ||
     message.includes("socket closed")
   );
+}
+
+async function readDriveChunk(drive, drivePath, offset, length) {
+  if (!drive || typeof drive.createReadStream !== "function") {
+    throw new Error("Drive does not support ranged reads");
+  }
+
+  if (length <= 0) return b4a.alloc(0);
+
+  const start = Math.max(0, Number(offset || 0));
+  const target = Math.max(1, Number(length || 0));
+  const end = start + target - 1;
+
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    const stream = drive.createReadStream(drivePath, { start, end });
+    stream.on("data", (chunk) => {
+      const bytes = b4a.from(chunk);
+      chunks.push(bytes);
+      total += bytes.byteLength;
+    });
+    stream.once("error", reject);
+    stream.once("end", () => {
+      if (total === 0) return resolve(b4a.alloc(0));
+      const joined = b4a.concat(chunks, total);
+      if (joined.byteLength <= target) return resolve(joined);
+      resolve(joined.subarray(0, target));
+    });
+  });
 }
