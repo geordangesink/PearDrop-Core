@@ -74,14 +74,14 @@ class TransferBackend {
     const fileManifest = [];
     for (const file of files) {
       const name = sanitizeName(file.name || "file.bin");
-      const drivePath = `/files/${name}`;
+      const drivePath = sanitizeDrivePath(file.drivePath || `/files/${name}`);
       const hasInlineData = Object.prototype.hasOwnProperty.call(
         file,
         "dataBase64",
       );
       const data = hasInlineData
         ? b4a.from(String(file.dataBase64 || ""), "base64")
-        : await fs.promises.readFile(file.path);
+        : await readUploadFile(file.path);
 
       await drive.put(drivePath, data);
       fileManifest.push({
@@ -596,6 +596,32 @@ function normalizeDriveKey(value) {
 
 function sanitizeName(name) {
   return String(name).replace(/[/\\]/g, "_");
+}
+
+function sanitizeDrivePath(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "/files/file.bin";
+  const prefixed = raw.startsWith("/") ? raw : `/${raw}`;
+  const noTraversal = prefixed.replace(/\.\./g, "_");
+  return noTraversal
+    .split("/")
+    .map((part, index) => (index === 0 ? "" : sanitizeName(part)))
+    .join("/");
+}
+
+async function readUploadFile(sourcePath) {
+  const resolved = String(sourcePath || "").trim();
+  if (!resolved) {
+    throw new Error("Upload file path is required");
+  }
+  try {
+    return await fs.promises.readFile(resolved);
+  } catch (error) {
+    if (error && String(error.code || "") === "ENOENT") {
+      throw new Error(`Source file does not exist: ${resolved}`);
+    }
+    throw error;
+  }
 }
 
 function randomId() {
