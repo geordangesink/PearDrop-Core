@@ -1,16 +1,16 @@
-let fs
-let path
+let fs;
+let path;
 
-if (typeof globalThis.Bare !== 'undefined') {
-  fs = require('bare-fs')
-  path = require('bare-path')
+if (typeof globalThis.Bare !== "undefined") {
+  fs = require("bare-fs");
+  path = require("bare-path");
 } else {
-  const nodeRequire = eval('require')
-  fs = nodeRequire('fs')
-  path = nodeRequire('path')
+  const nodeRequire = eval("require");
+  fs = nodeRequire("fs");
+  path = nodeRequire("path");
 }
 
 module.exports = {
   fs,
-  path
-}
+  path,
+};

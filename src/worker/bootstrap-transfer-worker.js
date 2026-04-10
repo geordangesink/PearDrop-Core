@@ -61,7 +61,7 @@ async function bootstrapTransferWorker({
     }
   })();
 
-  const close = async (reason = "close") => {
+  const close = async () => {
     if (closePromise) return closePromise;
     closing = true;
 

@@ -160,9 +160,12 @@ class TransferBackend {
   async startHostFromTransfer({ transferId, sessionName = "" }) {
     const transfer = await this.persistence.getTransferById(transferId);
     if (!transfer) throw new Error("Transfer not found");
-    if (!transfer.driveKey)
+    if (!transfer.driveKey) {
       throw new Error("Transfer does not include a drive key");
-    if (!transfer.invite) throw new Error("Transfer does not include an invite");
+    }
+    if (!transfer.invite) {
+      throw new Error("Transfer does not include an invite");
+    }
 
     if (this.liveHosts.has(transfer.invite)) {
       const host = this.liveHosts.get(transfer.invite);
@@ -174,7 +177,8 @@ class TransferBackend {
         manifest: host.fileManifest || [],
         hostSession: {
           invite: host.invite,
-          sessionName: host.sessionName || transfer.sessionName || "Host Session",
+          sessionName:
+            host.sessionName || transfer.sessionName || "Host Session",
           sessionLabel: host.sessionLabel || transfer.sessionLabel || "",
         },
       };
@@ -320,7 +324,12 @@ class TransferBackend {
 
     const safeOffset = Math.max(0, Number(offset || 0));
     const safeLength = Math.max(1, Math.min(1024 * 1024, Number(length || 0)));
-    const bytes = await readDriveChunk(drive, drivePath, safeOffset, safeLength);
+    const bytes = await readDriveChunk(
+      drive,
+      drivePath,
+      safeOffset,
+      safeLength,
+    );
 
     return {
       drivePath,
@@ -331,8 +340,9 @@ class TransferBackend {
   }
 
   async _attachDrive(driveKeyHex) {
-    if (this.liveDrives.has(driveKeyHex))
+    if (this.liveDrives.has(driveKeyHex)) {
       return this.liveDrives.get(driveKeyHex);
+    }
 
     const key = b4a.from(driveKeyHex, "hex");
     const drive = new Hyperdrive(this.store, key);
@@ -351,14 +361,17 @@ class TransferBackend {
       const handle = this.swarm.join(discoveryKey, { client, server });
       this.driveDiscoveries.set(driveKeyHex, {
         handle,
-        client: !!client,
-        server: !!server,
+        client: Boolean(client),
+        server: Boolean(server),
       });
       return;
     }
 
-    if (!!server && !existing.server) {
-      const handle = this.swarm.join(discoveryKey, { client: true, server: true });
+    if (server && !existing.server) {
+      const handle = this.swarm.join(discoveryKey, {
+        client: true,
+        server: true,
+      });
       this.driveDiscoveries.set(driveKeyHex, {
         handle,
         client: true,
@@ -455,7 +468,8 @@ class TransferBackend {
 
     const hostSessionName = String(sessionName || "").trim() || "Host Session";
     const hostSessionLabel =
-      String(sessionLabel || "").trim() || formatHostSessionLabel(hostSessionName);
+      String(sessionLabel || "").trim() ||
+      formatHostSessionLabel(hostSessionName);
     const createdAt = Date.now();
     const persisted = persistTransfer
       ? await this.persistence.appendTransfer({
@@ -620,8 +634,9 @@ class TransferBackend {
 
       if (request.type === "file") {
         const drivePath = String(request.path || "");
-        if (!drivePath.startsWith("/files/"))
+        if (!drivePath.startsWith("/files/")) {
           throw new Error("Invalid file path");
+        }
         const data = await this._waitForEntry(drive, drivePath);
         send({
           ok: true,
@@ -632,10 +647,14 @@ class TransferBackend {
 
       if (request.type === "file-chunk") {
         const drivePath = String(request.path || "");
-        if (!drivePath.startsWith("/files/"))
+        if (!drivePath.startsWith("/files/")) {
           throw new Error("Invalid file path");
+        }
         const offset = Math.max(0, Number(request.offset || 0));
-        const length = Math.max(1, Math.min(1024 * 1024, Number(request.length || 0)));
+        const length = Math.max(
+          1,
+          Math.min(1024 * 1024, Number(request.length || 0)),
+        );
         const bytes = await readDriveChunk(drive, drivePath, offset, length);
         send({
           ok: true,

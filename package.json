@@ -3,6 +3,10 @@
   "version": "0.2.0",
   "type": "commonjs",
   "main": "src/index.js",
+  "scripts": {
+    "lint": "prettier --check . && lunte",
+    "format": "prettier --write . && lunte --fix"
+  },
   "dependencies": {
     "b4a": "^1.8.0",
     "bare-fs": "^4.4.4",
@@ -24,6 +28,11 @@
       "simulator": "pear-mobile",
       "default": "pear-runtime"
     }
+  },
+  "devDependencies": {
+    "lunte": "^1.6.0",
+    "prettier": "^3.8.1",
+    "prettier-config-holepunch": "^2.0.0"
   },
   "license": "Apache-2.0"
 }
