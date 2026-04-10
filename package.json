@@ -24,5 +24,6 @@
       "simulator": "pear-mobile",
       "default": "pear-runtime"
     }
-  }
+  },
+  "license": "Apache-2.0"
 }

@@ -13,7 +13,7 @@ class TransferBackend {
     metadataDir = "",
     relayUrl = "",
     swarmOptions = {},
-    resolveWaitMs = 10000,
+    resolveWaitMs = 25000,
     resolveRetryMs = 150,
     flockJoinWaitMs = 8000,
   }) {
@@ -28,6 +28,7 @@ class TransferBackend {
     this.metadataDir = metadataDir || path.join(baseDir, "db");
     this.persistence = new HyperdbPersistence(this.metadataDir);
     this.liveDrives = new Map();
+    this.driveDiscoveries = new Map();
     this.liveFlocks = new Map();
     this.liveHosts = new Map();
     this.webHosts = new Map();
@@ -205,13 +206,47 @@ class TransferBackend {
 
   async getManifest({ invite }) {
     const { driveKey, roomInvite } = parseInvite(invite);
-    const resolvedDriveKey = await this._resolveDriveKey({
-      driveKey,
-      roomInvite,
-    });
-    const drive = await this._attachDrive(resolvedDriveKey);
-    const raw = await this._waitForEntry(drive, "/manifest.json");
-    return JSON.parse(raw.toString("utf8"));
+    const candidates = [];
+
+    if (roomInvite) {
+      try {
+        const flock = await this._attachFlock(roomInvite);
+        const fromRoom = await this._waitForFlockDriveKey(flock);
+        if (fromRoom) candidates.push(fromRoom);
+      } catch (error) {
+        console.error(
+          "[transfer-backend] manifest room key resolution failed:",
+          error?.message || String(error),
+        );
+      }
+    }
+
+    if (driveKey) candidates.push(driveKey);
+
+    const uniqueCandidates = [...new Set(candidates.filter(Boolean))];
+    if (uniqueCandidates.length === 0) {
+      throw new Error("Invite does not contain a usable drive key");
+    }
+
+    let lastError = null;
+    for (const key of uniqueCandidates) {
+      try {
+        console.log(
+          `[transfer-backend] trying manifest key ${String(key).slice(0, 12)}...`,
+        );
+        const drive = await this._attachDrive(key);
+        const raw = await this._waitForEntry(drive, "/manifest.json");
+        return JSON.parse(raw.toString("utf8"));
+      } catch (error) {
+        lastError = error;
+        console.error(
+          `[transfer-backend] manifest read failed for key ${String(key).slice(0, 12)}...:`,
+          error?.message || String(error),
+        );
+      }
+    }
+
+    throw lastError || new Error("Failed to load invite manifest");
   }
 
   async download({ invite, targetDir = path.join(this.baseDir, "downloads") }) {
@@ -302,19 +337,44 @@ class TransferBackend {
     const key = b4a.from(driveKeyHex, "hex");
     const drive = new Hyperdrive(this.store, key);
     await drive.ready();
-    this.swarm.join(drive.discoveryKey, { client: true, server: false });
+    this._ensureDriveDiscovery(driveKeyHex, drive.discoveryKey, {
+      client: true,
+      server: false,
+    });
     this.liveDrives.set(driveKeyHex, drive);
     return drive;
   }
 
-  async _resolveDriveKey({ driveKey, roomInvite }) {
-    if (driveKey) return driveKey;
+  _ensureDriveDiscovery(driveKeyHex, discoveryKey, { client, server }) {
+    const existing = this.driveDiscoveries.get(driveKeyHex);
+    if (!existing) {
+      const handle = this.swarm.join(discoveryKey, { client, server });
+      this.driveDiscoveries.set(driveKeyHex, {
+        handle,
+        client: !!client,
+        server: !!server,
+      });
+      return;
+    }
 
+    if (!!server && !existing.server) {
+      const handle = this.swarm.join(discoveryKey, { client: true, server: true });
+      this.driveDiscoveries.set(driveKeyHex, {
+        handle,
+        client: true,
+        server: true,
+      });
+    }
+  }
+
+  async _resolveDriveKey({ driveKey, roomInvite }) {
     if (roomInvite) {
       const flock = await this._attachFlock(roomInvite);
       const fromRoom = await this._waitForFlockDriveKey(flock);
       if (fromRoom) return fromRoom;
     }
+
+    if (driveKey) return driveKey;
 
     throw new Error("Invite does not contain a usable drive key");
   }
@@ -366,7 +426,10 @@ class TransferBackend {
     existingTransfer = null,
   }) {
     const driveKeyHex = drive.key.toString("hex");
-    this.swarm.join(drive.discoveryKey, { server: true, client: true });
+    this._ensureDriveDiscovery(driveKeyHex, drive.discoveryKey, {
+      client: true,
+      server: true,
+    });
     this.liveDrives.set(driveKeyHex, drive);
 
     const webHost = await this._createWebHostForDrive(drive);
@@ -475,6 +538,12 @@ class TransferBackend {
       await drive.close();
     }
     this.liveDrives.clear();
+    for (const entry of this.driveDiscoveries.values()) {
+      try {
+        await entry?.handle?.destroy?.();
+      } catch {}
+    }
+    this.driveDiscoveries.clear();
     await this.swarm?.destroy();
     await this.store?.close();
     await this.persistence.close();
