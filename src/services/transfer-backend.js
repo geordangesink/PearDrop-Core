@@ -72,31 +72,7 @@ class TransferBackend {
     );
     await drive.ready();
 
-    const fileManifest = [];
-    for (const file of files) {
-      const name = sanitizeName(file.name || "file.bin");
-      const drivePath = sanitizeDrivePath(file.drivePath || `/files/${name}`);
-      const hasInlineData = Object.prototype.hasOwnProperty.call(
-        file,
-        "dataBase64",
-      );
-      const data = hasInlineData
-        ? b4a.from(String(file.dataBase64 || ""), "base64")
-        : await readUploadFile(file.path);
-
-      await drive.put(drivePath, data);
-      fileManifest.push({
-        name,
-        drivePath,
-        byteLength: data.byteLength,
-        mimeType: file.mimeType || "application/octet-stream",
-      });
-    }
-
-    await drive.put(
-      "/manifest.json",
-      b4a.from(JSON.stringify({ files: fileManifest }, null, 2)),
-    );
+    const fileManifest = await this._writeFilesAndManifest({ drive, files });
 
     const hosted = await this._startHostingDrive({
       drive,
@@ -105,6 +81,46 @@ class TransferBackend {
       sessionName,
     });
     return hosted;
+  }
+
+  async updateActiveHost({ invite, files, sessionName = "" }) {
+    const key = String(invite || "");
+    if (!key) throw new Error("Invite is required");
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new Error("At least one file is required");
+    }
+
+    let host = this.liveHosts.get(key);
+    if (!host) {
+      const parsed = parseInvite(key);
+      host = Array.from(this.liveHosts.values()).find(
+        (item) => item.roomInvite === parsed.roomInvite,
+      );
+    }
+    if (!host) throw new Error("Active host session not found");
+
+    const drive = await this._attachDrive(host.driveKey);
+    const fileManifest = await this._writeFilesAndManifest({ drive, files });
+
+    const nextSessionName =
+      String(sessionName || host.sessionName || "").trim() || "Host Session";
+
+    host.fileManifest = fileManifest;
+    host.sessionName = nextSessionName;
+
+    this.liveHosts.set(host.invite, host);
+
+    return {
+      invite: host.invite,
+      nativeInvite: host.invite,
+      webSwarmLink: host.webSwarmLink || "",
+      manifest: fileManifest,
+      hostSession: {
+        invite: host.invite,
+        sessionName: host.sessionName,
+        sessionLabel: host.sessionLabel || "",
+      },
+    };
   }
 
   async listActiveHosts() {
@@ -672,6 +688,36 @@ class TransferBackend {
         error: error.message || String(error),
       });
     }
+  }
+
+  async _writeFilesAndManifest({ drive, files }) {
+    const fileManifest = [];
+    for (const file of files) {
+      const name = sanitizeName(file.name || "file.bin");
+      const drivePath = sanitizeDrivePath(file.drivePath || `/files/${name}`);
+      const hasInlineData = Object.prototype.hasOwnProperty.call(
+        file,
+        "dataBase64",
+      );
+      const data = hasInlineData
+        ? b4a.from(String(file.dataBase64 || ""), "base64")
+        : await readUploadFile(file.path);
+
+      await drive.put(drivePath, data);
+      fileManifest.push({
+        name,
+        drivePath,
+        byteLength: data.byteLength,
+        mimeType: file.mimeType || "application/octet-stream",
+      });
+    }
+
+    await drive.put(
+      "/manifest.json",
+      b4a.from(JSON.stringify({ files: fileManifest }, null, 2)),
+    );
+
+    return fileManifest;
   }
 }
 

@@ -134,6 +134,8 @@ async function bootstrapTransferWorker({
       guard(() => backend.stopHost(payload)),
     [RpcCommand.START_HOST_FROM_TRANSFER]: async (payload) =>
       guard(() => backend.startHostFromTransfer(payload)),
+    [RpcCommand.UPDATE_ACTIVE_HOST]: async (payload) =>
+      guard(() => backend.updateActiveHost(payload)),
   });
 
   return { backend, updaterWorker, close };
