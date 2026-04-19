@@ -1,4 +1,6 @@
 let PearRuntime = null;
+const { overrideApplyUpdate } = require("./pear-runtime-updater-override");
+const UPDATE_APPLIED_TOKEN = "__PEARDROP_UPDATE_APPLIED__";
 
 try {
   PearRuntime = require("#pear");
@@ -37,6 +39,7 @@ class UpdaterWorker {
     }
 
     this.updater = this.pear.updater || null;
+    overrideApplyUpdate(this.updater, this.config?.squirrel);
     this._bindUpdaterEvents();
     return true;
   }
@@ -61,7 +64,15 @@ class UpdaterWorker {
         return;
       }
       try {
+        if (
+          !this.updater.updated ||
+          this.updater.applied ||
+          !this.updater.bundled
+        ) {
+          return;
+        }
         await this.updater.applyUpdate();
+        console.log(UPDATE_APPLIED_TOKEN);
       } catch (error) {
         console.error("[peardrops:updater] apply update failed", error);
       }
@@ -90,4 +101,5 @@ class UpdaterWorker {
 
 module.exports = {
   UpdaterWorker,
+  UPDATE_APPLIED_TOKEN,
 };
