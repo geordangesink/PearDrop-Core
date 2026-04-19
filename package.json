@@ -7,6 +7,9 @@
     "lint": "prettier --check . && lunte",
     "format": "prettier --write . && lunte --fix"
   },
+  "files": [
+    "/src"
+  ],
   "dependencies": {
     "b4a": "^1.8.0",
     "bare-fs": "^4.4.4",
