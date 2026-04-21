@@ -61,7 +61,7 @@ class TransferBackend {
     return this.persistence.listTransfers();
   }
 
-  async createUpload({ files, sessionName = "" }) {
+  async createUpload({ files, sessionName = "", nativeInvite = "" }) {
     if (!Array.isArray(files) || files.length === 0) {
       throw new Error("At least one file is required");
     }
@@ -79,6 +79,7 @@ class TransferBackend {
       transferId,
       fileManifest,
       sessionName,
+      nativeInvite,
     });
     return hosted;
   }
@@ -128,6 +129,7 @@ class TransferBackend {
       .map((host) => ({
         transferId: host.transferId,
         invite: host.invite,
+        webSwarmLink: host.webSwarmLink || "",
         driveKey: host.driveKey,
         roomInvite: host.roomInvite,
         sessionName: host.sessionName,
