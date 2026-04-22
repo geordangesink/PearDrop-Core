@@ -1,6 +1,7 @@
 const { TransferBackend } = require("../services/transfer-backend");
 const { RpcCommand, createRpcServer } = require("../rpc/hrpc-bridge");
 const { UpdaterWorker } = require("../runtime/updater-worker");
+const HOST_UPLOAD_PROGRESS_TOKEN = "__PEARDROP_HOST_UPLOAD_PROGRESS__";
 
 async function bootstrapTransferWorker({
   ipc,
@@ -17,6 +18,11 @@ async function bootstrapTransferWorker({
     baseDir,
     metadataDir,
     relayUrl: relayUrl || updaterConfig.relayUrl || "",
+    uploadProgress: (progress) => {
+      try {
+        console.log(`${HOST_UPLOAD_PROGRESS_TOKEN}${JSON.stringify(progress || {})}`);
+      } catch {}
+    },
   });
 
   await readyBackendWithLockRetry(backend);

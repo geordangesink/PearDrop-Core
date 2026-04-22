@@ -12,6 +12,7 @@ class TransferBackend {
     baseDir,
     metadataDir = "",
     relayUrl = "",
+    uploadProgress = null,
     swarmOptions = {},
     resolveWaitMs = 25000,
     resolveRetryMs = 150,
@@ -33,6 +34,8 @@ class TransferBackend {
     this.liveHosts = new Map();
     this.webHosts = new Map();
     this.flockManager = null;
+    this.uploadProgress =
+      typeof uploadProgress === "function" ? uploadProgress : null;
   }
 
   async ready() {
@@ -693,8 +696,24 @@ class TransferBackend {
   }
 
   async _writeFilesAndManifest({ drive, files }) {
+    const totalBytes = files.reduce(
+      (sum, file) => sum + Math.max(0, Number(file?.byteLength || 0)),
+      0,
+    );
+    let completedBytes = 0;
+    this._emitUploadProgress({
+      phase: "start",
+      completedBytes: 0,
+      totalBytes,
+      fileIndex: 0,
+      fileCount: files.length,
+      fileName: "",
+      remainingBytes: totalBytes,
+    });
+
     const fileManifest = [];
-    for (const file of files) {
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
       const name = sanitizeName(file.name || "file.bin");
       const drivePath = sanitizeDrivePath(file.drivePath || `/files/${name}`);
       const hasInlineData = Object.prototype.hasOwnProperty.call(
@@ -706,6 +725,16 @@ class TransferBackend {
         : await readUploadFile(file.path);
 
       await drive.put(drivePath, data);
+      completedBytes += Math.max(0, Number(data.byteLength || 0));
+      this._emitUploadProgress({
+        phase: "file",
+        completedBytes,
+        totalBytes,
+        fileIndex: i + 1,
+        fileCount: files.length,
+        fileName: name,
+        remainingBytes: Math.max(0, totalBytes - completedBytes),
+      });
       fileManifest.push({
         name,
         drivePath,
@@ -718,8 +747,24 @@ class TransferBackend {
       "/manifest.json",
       b4a.from(JSON.stringify({ files: fileManifest }, null, 2)),
     );
+    this._emitUploadProgress({
+      phase: "done",
+      completedBytes: Math.max(completedBytes, totalBytes),
+      totalBytes,
+      fileIndex: files.length,
+      fileCount: files.length,
+      fileName: "",
+      remainingBytes: 0,
+    });
 
     return fileManifest;
+  }
+
+  _emitUploadProgress(progress) {
+    if (!this.uploadProgress) return;
+    try {
+      this.uploadProgress(progress || {});
+    } catch {}
   }
 }
 
