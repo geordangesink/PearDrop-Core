@@ -60,7 +60,7 @@ class TransferBackend {
     await this.persistence.ready();
   }
 
-  async listTransfers() {
+  listTransfers() {
     return this.persistence.listTransfers();
   }
 
@@ -127,7 +127,7 @@ class TransferBackend {
     };
   }
 
-  async listActiveHosts() {
+  listActiveHosts() {
     const hosts = Array.from(this.liveHosts.values())
       .map((host) => ({
         transferId: host.transferId,
@@ -615,7 +615,7 @@ class TransferBackend {
     };
   }
 
-  async _handleWebTransferSocket(socket, drive) {
+  _handleWebTransferSocket(socket, drive) {
     let buffered = "";
 
     socket.on("data", async (chunk) => {

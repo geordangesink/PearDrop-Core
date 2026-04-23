@@ -9,7 +9,7 @@ class HyperdbPersistence {
     this.db = null;
   }
 
-  async ready() {
+  ready() {
     this.db = HyperDB.rocks(this.dbPath, definition);
   }
 
@@ -34,7 +34,7 @@ class HyperdbPersistence {
     return persisted;
   }
 
-  async getTransferById(id) {
+  getTransferById(id) {
     const key = String(id || "");
     if (!key) return null;
     return this.db.get(COLLECTION_NAME, { id: key });

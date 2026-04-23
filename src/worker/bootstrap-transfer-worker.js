@@ -20,7 +20,9 @@ async function bootstrapTransferWorker({
     relayUrl: relayUrl || updaterConfig.relayUrl || "",
     uploadProgress: (progress) => {
       try {
-        console.log(`${HOST_UPLOAD_PROGRESS_TOKEN}${JSON.stringify(progress || {})}`);
+        console.log(
+          `${HOST_UPLOAD_PROGRESS_TOKEN}${JSON.stringify(progress || {})}`,
+        );
       } catch {}
     },
   });
@@ -67,7 +69,7 @@ async function bootstrapTransferWorker({
     }
   })();
 
-  const close = async () => {
+  const close = () => {
     if (closePromise) return closePromise;
     closing = true;
 
@@ -103,7 +105,7 @@ async function bootstrapTransferWorker({
     });
   }
 
-  const guard = async (fn) => {
+  const guard = (fn) => {
     if (closing) throw new Error("Worker is shutting down");
     return fn();
   };
@@ -113,34 +115,32 @@ async function bootstrapTransferWorker({
       await close("rpc shutdown");
       return { closed: true };
     },
-    [RpcCommand.INIT]: async () =>
+    [RpcCommand.INIT]: () =>
       guard(async () => ({
         version: updaterConfig.version || "0.1.0",
         transfers: await backend.listTransfers(),
         updater: updaterWorker.status(),
         updaterError,
       })),
-    [RpcCommand.LIST_TRANSFERS]: async () =>
+    [RpcCommand.LIST_TRANSFERS]: () =>
       guard(async () => ({
         transfers: await backend.listTransfers(),
       })),
-    [RpcCommand.CREATE_UPLOAD]: async (payload) =>
+    [RpcCommand.CREATE_UPLOAD]: (payload) =>
       guard(() => backend.createUpload(payload)),
-    [RpcCommand.GET_MANIFEST]: async (payload) =>
+    [RpcCommand.GET_MANIFEST]: (payload) =>
       guard(() => backend.getManifest(payload)),
-    [RpcCommand.DOWNLOAD]: async (payload) =>
-      guard(() => backend.download(payload)),
-    [RpcCommand.READ_ENTRY]: async (payload) =>
+    [RpcCommand.DOWNLOAD]: (payload) => guard(() => backend.download(payload)),
+    [RpcCommand.READ_ENTRY]: (payload) =>
       guard(() => backend.readEntry(payload)),
-    [RpcCommand.READ_ENTRY_CHUNK]: async (payload) =>
+    [RpcCommand.READ_ENTRY_CHUNK]: (payload) =>
       guard(() => backend.readEntryChunk(payload)),
-    [RpcCommand.LIST_ACTIVE_HOSTS]: async () =>
+    [RpcCommand.LIST_ACTIVE_HOSTS]: () =>
       guard(() => backend.listActiveHosts()),
-    [RpcCommand.STOP_HOST]: async (payload) =>
-      guard(() => backend.stopHost(payload)),
-    [RpcCommand.START_HOST_FROM_TRANSFER]: async (payload) =>
+    [RpcCommand.STOP_HOST]: (payload) => guard(() => backend.stopHost(payload)),
+    [RpcCommand.START_HOST_FROM_TRANSFER]: (payload) =>
       guard(() => backend.startHostFromTransfer(payload)),
-    [RpcCommand.UPDATE_ACTIVE_HOST]: async (payload) =>
+    [RpcCommand.UPDATE_ACTIVE_HOST]: (payload) =>
       guard(() => backend.updateActiveHost(payload)),
   });
 
