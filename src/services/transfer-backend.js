@@ -591,9 +591,7 @@ class TransferBackend {
 
     if (this.webHosts.has(topicHex)) return { topicHex };
 
-    const keyPair = await this.store.createKeyPair(
-      `peardrops-web-${driveKeyHex}`,
-    );
+    const keyPair = await this.store.createKeyPair(`peardrops-web-${driveKeyHex}`);
     const swarm = new Hyperswarm({
       keyPair,
       ...this.swarmOptions,
@@ -608,10 +606,11 @@ class TransferBackend {
     const discovery = swarm.join(topic, { server: true, client: false });
     await discovery.flushed();
 
+    const hostPublicKey = b4a.toString(keyPair.publicKey, "hex");
     this.webHosts.set(topicHex, { swarm, discovery, drive });
     return {
       topicHex,
-      hostPublicKey: b4a.toString(keyPair.publicKey, "hex"),
+      hostPublicKey,
     };
   }
 
