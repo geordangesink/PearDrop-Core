@@ -1007,9 +1007,9 @@ class TransferBackend {
       };
     }
 
-    const keyPair = await this.store.createKeyPair(
-      `peardrops-web-${driveKeyHex}`,
-    );
+    // Keep relay-host identity deterministic per drive so "use server" links
+    // remain valid across app restarts.
+    const keyPair = deriveDeterministicWebHostKeyPair(drive.discoveryKey);
     const swarm = new Hyperswarm({
       keyPair,
       ...this.swarmOptions,
@@ -1238,6 +1238,16 @@ function deriveWebTopic(discoveryKey) {
   topic[0] ^= 0x70;
   topic[1] ^= 0x64;
   return topic;
+}
+
+function deriveDeterministicWebHostKeyPair(discoveryKey) {
+  const seed = b4a.from(discoveryKey);
+  // Namespace the seed so the relay host identity is independent from topic.
+  seed[0] ^= 0x77;
+  seed[1] ^= 0x68;
+  seed[2] ^= 0x6f;
+  seed[3] ^= 0x73;
+  return DHT.keyPair(seed);
 }
 
 function formatHostSessionLabel(baseName) {
