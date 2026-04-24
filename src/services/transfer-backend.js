@@ -263,10 +263,21 @@ class TransferBackend {
     });
   }
 
-  async getManifest({ invite }) {
+  async getManifest({
+    invite,
+    forceRelay = false,
+    useServer = false,
+    transportMode = "",
+  }) {
     const parsedInvite = parseInvite(invite);
     const { driveKey, roomInvite } = parsedInvite;
-    if (this._shouldPreferRelayDrive(parsedInvite)) {
+    if (
+      this._shouldPreferRelayDrive(parsedInvite, {
+        forceRelay,
+        useServer,
+        transportMode,
+      })
+    ) {
       try {
         return await this._getManifestViaRelay(parsedInvite);
       } catch (error) {
@@ -320,10 +331,22 @@ class TransferBackend {
     throw lastError || new Error("Failed to load invite manifest");
   }
 
-  async download({ invite, targetDir = path.join(this.baseDir, "downloads") }) {
+  async download({
+    invite,
+    targetDir = path.join(this.baseDir, "downloads"),
+    forceRelay = false,
+    useServer = false,
+    transportMode = "",
+  }) {
     const parsedInvite = parseInvite(invite);
     const { driveKey, roomInvite } = parsedInvite;
-    if (this._shouldPreferRelayDrive(parsedInvite)) {
+    if (
+      this._shouldPreferRelayDrive(parsedInvite, {
+        forceRelay,
+        useServer,
+        transportMode,
+      })
+    ) {
       try {
         return await this._downloadViaRelay({
           parsedInvite,
@@ -372,14 +395,26 @@ class TransferBackend {
     };
   }
 
-  async readEntry({ invite, drivePath }) {
+  async readEntry({
+    invite,
+    drivePath,
+    forceRelay = false,
+    useServer = false,
+    transportMode = "",
+  }) {
     if (!drivePath || typeof drivePath !== "string") {
       throw new Error("drivePath is required");
     }
 
     const parsedInvite = parseInvite(invite);
     const { driveKey, roomInvite } = parsedInvite;
-    if (this._shouldPreferRelayDrive(parsedInvite)) {
+    if (
+      this._shouldPreferRelayDrive(parsedInvite, {
+        forceRelay,
+        useServer,
+        transportMode,
+      })
+    ) {
       try {
         return await this._readEntryViaRelay({ parsedInvite, drivePath });
       } catch (error) {
@@ -403,14 +438,28 @@ class TransferBackend {
     };
   }
 
-  async readEntryChunk({ invite, drivePath, offset = 0, length = 256 * 1024 }) {
+  async readEntryChunk({
+    invite,
+    drivePath,
+    offset = 0,
+    length = 256 * 1024,
+    forceRelay = false,
+    useServer = false,
+    transportMode = "",
+  }) {
     if (!drivePath || typeof drivePath !== "string") {
       throw new Error("drivePath is required");
     }
 
     const parsedInvite = parseInvite(invite);
     const { driveKey, roomInvite } = parsedInvite;
-    if (this._shouldPreferRelayDrive(parsedInvite)) {
+    if (
+      this._shouldPreferRelayDrive(parsedInvite, {
+        forceRelay,
+        useServer,
+        transportMode,
+      })
+    ) {
       try {
         return await this._readEntryChunkViaRelay({
           parsedInvite,
@@ -590,18 +639,23 @@ class TransferBackend {
       } catch {}
     }
 
+    const parsedDriveKey = String(parsedNativeInvite?.driveKey || "").trim();
+    const canReuseInviteFields =
+      Boolean(parsedNativeInvite) &&
+      parsedDriveKey &&
+      parsedDriveKey === String(driveKeyHex || "").trim();
+
     const relayForLinks =
-      String(parsedNativeInvite?.relayUrl || "").trim() ||
+      String(canReuseInviteFields ? parsedNativeInvite?.relayUrl : "").trim() ||
       String(this.relayUrl || "").trim();
     const topicForLinks =
-      String(parsedNativeInvite?.topic || "").trim() ||
+      String(canReuseInviteFields ? parsedNativeInvite?.topic : "").trim() ||
       String(webHost.topicHex || "").trim();
     const roomForInvite =
-      String(parsedNativeInvite?.roomInvite || "").trim() ||
-      String(flock.invite || "").trim();
-    const driveForInvite =
-      String(parsedNativeInvite?.driveKey || "").trim() ||
-      String(driveKeyHex || "").trim();
+      String(
+        canReuseInviteFields ? parsedNativeInvite?.roomInvite : "",
+      ).trim() || String(flock.invite || "").trim();
+    const driveForInvite = String(driveKeyHex || "").trim();
     const inviteApp = (() => {
       const requested = String(parsedNativeInvite?.app || "native")
         .trim()
@@ -698,8 +752,16 @@ class TransferBackend {
     );
   }
 
-  _shouldPreferRelayDrive(parsedInvite) {
-    return Boolean(String(parsedInvite?.webKey || "").trim());
+  _shouldPreferRelayDrive(parsedInvite, options = {}) {
+    const hasWebKey = Boolean(String(parsedInvite?.webKey || "").trim());
+    if (!hasWebKey) return false;
+    const requested =
+      Boolean(options?.forceRelay) ||
+      Boolean(options?.useServer) ||
+      String(options?.transportMode || "")
+        .trim()
+        .toLowerCase() === "turn";
+    return requested;
   }
 
   _resolveRelayUrl(parsedInvite) {
@@ -919,7 +981,13 @@ class TransferBackend {
     const topic = deriveWebTopic(drive.discoveryKey);
     const topicHex = b4a.toString(topic, "hex");
 
-    if (this.webHosts.has(topicHex)) return { topicHex };
+    if (this.webHosts.has(topicHex)) {
+      const existing = this.webHosts.get(topicHex);
+      return {
+        topicHex,
+        hostPublicKey: String(existing?.hostPublicKey || ""),
+      };
+    }
 
     const keyPair = await this.store.createKeyPair(
       `peardrops-web-${driveKeyHex}`,
@@ -941,7 +1009,12 @@ class TransferBackend {
     await discovery.flushed();
 
     const hostPublicKey = b4a.toString(keyPair.publicKey, "hex");
-    this.webHosts.set(topicHex, { swarm, discovery, drive });
+    this.webHosts.set(topicHex, {
+      swarm,
+      discovery,
+      drive,
+      hostPublicKey,
+    });
     return {
       topicHex,
       hostPublicKey,
