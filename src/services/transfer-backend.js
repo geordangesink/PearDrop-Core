@@ -141,6 +141,7 @@ class TransferBackend {
   }
 
   listActiveHosts() {
+    this._pruneZombieHosts();
     const hosts = Array.from(this.liveHosts.values())
       .map((host) => ({
         transferId: host.transferId,
@@ -157,7 +158,7 @@ class TransferBackend {
           0,
         ),
         manifest: host.fileManifest,
-        online: true,
+        online: host?.flock?.closed !== true,
       }))
       .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
     return { hosts };
@@ -168,27 +169,45 @@ class TransferBackend {
     if (!key) throw new Error("Invite is required");
     let host = this.liveHosts.get(key);
     if (!host) {
-      const parsed = parseInvite(key);
-      host = Array.from(this.liveHosts.values()).find(
-        (item) => item.roomInvite === parsed.roomInvite,
-      );
+      try {
+        const parsed = parseInvite(key);
+        host = Array.from(this.liveHosts.values()).find(
+          (item) => item.roomInvite === parsed.roomInvite,
+        );
+      } catch {}
     }
     if (!host) return { stopped: false };
 
-    await host.flock.close();
-    this.liveFlocks.delete(host.roomInvite);
-    this.liveHosts.delete(host.invite);
-
-    if (host.topicHex && !this._isTopicInUse(host.topicHex)) {
-      const webHost = this.webHosts.get(host.topicHex);
-      if (webHost) {
-        await webHost.discovery.destroy();
-        await webHost.swarm.destroy();
+    let closeError = null;
+    try {
+      if (host.flock && typeof host.flock.close === "function") {
+        await host.flock.close();
       }
-      this.webHosts.delete(host.topicHex);
+    } catch (error) {
+      closeError = error || new Error("Failed closing host flock");
+    } finally {
+      this.liveFlocks.delete(host.roomInvite);
+      this.liveHosts.delete(host.invite);
+
+      if (host.topicHex && !this._isTopicInUse(host.topicHex)) {
+        const webHost = this.webHosts.get(host.topicHex);
+        if (webHost) {
+          try {
+            await webHost.discovery.destroy();
+          } catch {}
+          try {
+            await webHost.swarm.destroy();
+          } catch {}
+        }
+        this.webHosts.delete(host.topicHex);
+      }
     }
 
-    return { stopped: true, invite: host.invite };
+    return {
+      stopped: true,
+      invite: host.invite,
+      warning: closeError ? String(closeError.message || closeError) : "",
+    };
   }
 
   async startHostFromTransfer({ transferId, sessionName = "" }) {
@@ -515,6 +534,7 @@ class TransferBackend {
         driveKey: driveKeyHex,
         roomInvite: flock.invite,
         topic: webHost.topicHex,
+        webKey: webHost.hostPublicKey,
         relayUrl: this.relayUrl,
         app: "native",
       });
@@ -595,6 +615,17 @@ class TransferBackend {
     );
   }
 
+  _pruneZombieHosts() {
+    for (const host of Array.from(this.liveHosts.values())) {
+      const hasFlockCloser =
+        host?.flock && typeof host.flock.close === "function";
+      const flockClosed = host?.flock?.closed === true;
+      if (hasFlockCloser && !flockClosed) continue;
+      this.liveFlocks.delete(host?.roomInvite);
+      this.liveHosts.delete(host?.invite);
+    }
+  }
+
   async close() {
     for (const flock of this.liveFlocks.values()) {
       await flock.close();
@@ -644,9 +675,11 @@ class TransferBackend {
     });
     swarm.on("connection", (socket) => {
       attachSocketErrorHandler(socket);
-      this._handleWebTransferSocket(socket, drive).catch(() => {
+      try {
+        this._handleWebTransferSocket(socket, drive);
+      } catch {
         socket.destroy();
-      });
+      }
     });
 
     const discovery = swarm.join(topic, { server: true, client: false });
