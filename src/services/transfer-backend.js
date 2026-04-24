@@ -4,6 +4,8 @@ const Corestore = require("corestore");
 const Hyperdrive = require("hyperdrive");
 const Hyperswarm = require("hyperswarm");
 const FlockManager = require("flockmanager");
+const DHT = require("@hyperswarm/dht-relay");
+const RelayStream = require("@hyperswarm/dht-relay/ws");
 const { HyperdbPersistence } = require("../persistence/hyperdb-persistence");
 const { createInvite, parseInvite } = require("../utils/invite");
 
@@ -262,7 +264,18 @@ class TransferBackend {
   }
 
   async getManifest({ invite }) {
-    const { driveKey, roomInvite } = parseInvite(invite);
+    const parsedInvite = parseInvite(invite);
+    const { driveKey, roomInvite } = parsedInvite;
+    if (this._shouldPreferRelayDrive(parsedInvite)) {
+      try {
+        return await this._getManifestViaRelay(parsedInvite);
+      } catch (error) {
+        console.error(
+          "[transfer-backend] relay manifest read failed, falling back to direct:",
+          error?.message || String(error),
+        );
+      }
+    }
     const candidates = [];
 
     // Prefer explicit drive keys first; room rendezvous may be stale after host restarts.
@@ -308,7 +321,22 @@ class TransferBackend {
   }
 
   async download({ invite, targetDir = path.join(this.baseDir, "downloads") }) {
-    const { driveKey, roomInvite } = parseInvite(invite);
+    const parsedInvite = parseInvite(invite);
+    const { driveKey, roomInvite } = parsedInvite;
+    if (this._shouldPreferRelayDrive(parsedInvite)) {
+      try {
+        return await this._downloadViaRelay({
+          parsedInvite,
+          invite,
+          targetDir,
+        });
+      } catch (error) {
+        console.error(
+          "[transfer-backend] relay download failed, falling back to direct:",
+          error?.message || String(error),
+        );
+      }
+    }
     const resolvedDriveKey = await this._resolveDriveKey({
       driveKey,
       roomInvite,
@@ -349,7 +377,18 @@ class TransferBackend {
       throw new Error("drivePath is required");
     }
 
-    const { driveKey, roomInvite } = parseInvite(invite);
+    const parsedInvite = parseInvite(invite);
+    const { driveKey, roomInvite } = parsedInvite;
+    if (this._shouldPreferRelayDrive(parsedInvite)) {
+      try {
+        return await this._readEntryViaRelay({ parsedInvite, drivePath });
+      } catch (error) {
+        console.error(
+          "[transfer-backend] relay file read failed, falling back to direct:",
+          error?.message || String(error),
+        );
+      }
+    }
     const resolvedDriveKey = await this._resolveDriveKey({
       driveKey,
       roomInvite,
@@ -369,7 +408,23 @@ class TransferBackend {
       throw new Error("drivePath is required");
     }
 
-    const { driveKey, roomInvite } = parseInvite(invite);
+    const parsedInvite = parseInvite(invite);
+    const { driveKey, roomInvite } = parsedInvite;
+    if (this._shouldPreferRelayDrive(parsedInvite)) {
+      try {
+        return await this._readEntryChunkViaRelay({
+          parsedInvite,
+          drivePath,
+          offset,
+          length,
+        });
+      } catch (error) {
+        console.error(
+          "[transfer-backend] relay chunk read failed, falling back to direct:",
+          error?.message || String(error),
+        );
+      }
+    }
     const resolvedDriveKey = await this._resolveDriveKey({
       driveKey,
       roomInvite,
@@ -613,6 +668,178 @@ class TransferBackend {
     return Array.from(this.liveHosts.values()).some(
       (item) => item.topicHex === topicHex,
     );
+  }
+
+  _shouldPreferRelayDrive(parsedInvite) {
+    return Boolean(String(parsedInvite?.webKey || "").trim());
+  }
+
+  _resolveRelayUrl(parsedInvite) {
+    return (
+      String(parsedInvite?.relayUrl || "").trim() ||
+      String(this.relayUrl || "").trim() ||
+      "wss://pear-drops.up.railway.app"
+    );
+  }
+
+  async _openRelayDriveSession(parsedInvite) {
+    const webKeyHex = String(parsedInvite?.webKey || "").trim();
+    if (!webKeyHex) throw new Error("Invite is missing web host key");
+    const relayUrl = this._resolveRelayUrl(parsedInvite);
+    const WebSocketCtor = globalThis.WebSocket;
+    if (typeof WebSocketCtor !== "function") {
+      throw new Error("WebSocket runtime is unavailable");
+    }
+
+    const relaySocket = new WebSocketCtor(relayUrl);
+    await onceWebSocketOpen(relaySocket);
+
+    const dht = new DHT(new RelayStream(true, relaySocket));
+    const stream = dht.connect(b4a.from(webKeyHex, "hex"));
+    stream.on("error", (error) => onBenignConnectionError(error));
+    await onceRelayStreamOpen(stream);
+    const peer = createLinePeer(stream);
+
+    let nextId = 1;
+    const pending = new Map();
+
+    peer.onMessage((message) => {
+      const id = Number(message?.id || 0);
+      if (!id || !pending.has(id)) return;
+      const waiter = pending.get(id);
+      pending.delete(id);
+      if (message?.ok === false) {
+        waiter.reject(
+          new Error(String(message?.error || "Peer request failed")),
+        );
+        return;
+      }
+      waiter.resolve(message || {});
+    });
+
+    return {
+      async request(payload) {
+        const id = nextId++;
+        peer.send({ id, ...(payload || {}) });
+        return await new Promise((resolve, reject) => {
+          pending.set(id, { resolve, reject });
+        });
+      },
+      async close() {
+        for (const waiter of pending.values()) {
+          waiter.reject(new Error("Relay drive session closed"));
+        }
+        pending.clear();
+        try {
+          stream.destroy();
+        } catch {}
+        try {
+          await dht.destroy();
+        } catch {}
+        try {
+          relaySocket.close();
+        } catch {}
+      },
+    };
+  }
+
+  async _getManifestViaRelay(parsedInvite) {
+    const relay = await this._openRelayDriveSession(parsedInvite);
+    try {
+      const response = await relay.request({ type: "manifest" });
+      return response?.manifest || { files: [] };
+    } finally {
+      await relay.close();
+    }
+  }
+
+  async _readEntryViaRelay({ parsedInvite, drivePath }) {
+    const relay = await this._openRelayDriveSession(parsedInvite);
+    try {
+      const response = await relay.request({ type: "file", path: drivePath });
+      const dataBase64 = String(response?.dataBase64 || "");
+      const bytes = b4a.from(dataBase64, "base64");
+      return {
+        drivePath,
+        dataBase64,
+        byteLength: Number(response?.byteLength || bytes.byteLength || 0),
+      };
+    } finally {
+      await relay.close();
+    }
+  }
+
+  async _readEntryChunkViaRelay({
+    parsedInvite,
+    drivePath,
+    offset = 0,
+    length = 256 * 1024,
+  }) {
+    const safeOffset = Math.max(0, Number(offset || 0));
+    const safeLength = Math.max(1, Math.min(1024 * 1024, Number(length || 0)));
+    const relay = await this._openRelayDriveSession(parsedInvite);
+    try {
+      const response = await relay.request({
+        type: "file-chunk",
+        path: drivePath,
+        offset: safeOffset,
+        length: safeLength,
+      });
+      const dataBase64 = String(response?.dataBase64 || "");
+      const bytes = b4a.from(dataBase64, "base64");
+      return {
+        drivePath,
+        offset: safeOffset,
+        byteLength: Number(response?.byteLength || bytes.byteLength || 0),
+        dataBase64,
+      };
+    } finally {
+      await relay.close();
+    }
+  }
+
+  async _downloadViaRelay({ parsedInvite, invite, targetDir }) {
+    const relay = await this._openRelayDriveSession(parsedInvite);
+    try {
+      const manifestResponse = await relay.request({ type: "manifest" });
+      const manifest = manifestResponse?.manifest || { files: [] };
+      const files = Array.isArray(manifest.files) ? manifest.files : [];
+
+      await fs.promises.mkdir(targetDir, { recursive: true });
+
+      const saved = [];
+      for (const entry of files) {
+        const drivePath = String(entry?.drivePath || "");
+        if (!drivePath) continue;
+        const response = await relay.request({ type: "file", path: drivePath });
+        const data = b4a.from(String(response?.dataBase64 || ""), "base64");
+        const outPath = path.join(
+          targetDir,
+          sanitizeName(String(entry?.name || "file.bin")),
+        );
+        await fs.promises.writeFile(outPath, data);
+        saved.push({
+          name: String(entry?.name || path.basename(outPath)),
+          path: outPath,
+          byteLength: data.byteLength,
+        });
+      }
+
+      const persisted = await this.persistence.appendTransfer({
+        type: "download",
+        driveKey: String(parsedInvite?.driveKey || ""),
+        invite,
+        fileCount: saved.length,
+        totalBytes: saved.reduce((sum, item) => sum + item.byteLength, 0),
+      });
+
+      return {
+        transfer: persisted,
+        files: saved,
+      };
+    } finally {
+      await relay.close();
+    }
   }
 
   _pruneZombieHosts() {
@@ -969,6 +1196,107 @@ function isBenignConnectionError(error) {
     message.includes("stream was destroyed") ||
     message.includes("socket closed")
   );
+}
+
+function createLinePeer(stream) {
+  let buffered = "";
+  const listeners = new Set();
+
+  stream.on("data", (chunk) => {
+    buffered += b4a.toString(chunk, "utf8");
+    let newline = buffered.indexOf("\n");
+    while (newline !== -1) {
+      const line = buffered.slice(0, newline).trim();
+      buffered = buffered.slice(newline + 1);
+      if (line) {
+        try {
+          const message = JSON.parse(line);
+          for (const listener of listeners) void listener(message);
+        } catch {}
+      }
+      newline = buffered.indexOf("\n");
+    }
+  });
+
+  return {
+    send(message) {
+      stream.write(b4a.from(`${JSON.stringify(message || {})}\n`, "utf8"));
+    },
+    onMessage(listener) {
+      listeners.add(listener);
+    },
+  };
+}
+
+function onceWebSocketOpen(socket) {
+  const openedStates = new Set([1, socket?.OPEN]);
+  if (openedStates.has(socket?.readyState)) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      if (typeof socket?.removeEventListener === "function") {
+        socket.removeEventListener("open", onOpen);
+        socket.removeEventListener("error", onError);
+      }
+      if (socket) {
+        if (socket.onopen === onOpen) socket.onopen = null;
+        if (socket.onerror === onError) socket.onerror = null;
+      }
+    };
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+
+    const onOpen = () => finish(resolve);
+    const onError = (error) =>
+      finish(reject, error || new Error("Relay websocket connection failed"));
+
+    if (typeof socket?.addEventListener === "function") {
+      socket.addEventListener("open", onOpen);
+      socket.addEventListener("error", onError);
+      return;
+    }
+    if (socket) {
+      socket.onopen = onOpen;
+      socket.onerror = onError;
+      return;
+    }
+    finish(reject, new Error("Relay websocket is unavailable"));
+  });
+}
+
+function onceRelayStreamOpen(stream) {
+  if (stream?.opened || stream?.writable) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      stream?.off?.("open", onOpen);
+      stream?.off?.("error", onError);
+      stream?.removeListener?.("open", onOpen);
+      stream?.removeListener?.("error", onError);
+    };
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+
+    const onOpen = () => finish(resolve);
+    const onError = (error) =>
+      finish(reject, error || new Error("Relay stream failed"));
+
+    stream?.on?.("open", onOpen);
+    stream?.on?.("error", onError);
+  });
 }
 
 async function readDriveChunk(drive, drivePath, offset, length) {
