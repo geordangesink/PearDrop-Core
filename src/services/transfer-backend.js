@@ -25,10 +25,13 @@ class TransferBackend {
     this.resolveRetryMs = resolveRetryMs;
     this.flockJoinWaitMs = flockJoinWaitMs;
     this.store = null;
+    this.inviteStore = null;
     this.swarm = null;
     this.metadataDir = metadataDir || path.join(baseDir, "db");
+    this.inviteCacheDir = path.join(baseDir, "invite-cache");
     this.persistence = new HyperdbPersistence(this.metadataDir);
     this.liveDrives = new Map();
+    this.inviteDrives = new Map();
     this.driveDiscoveries = new Map();
     this.liveFlocks = new Map();
     this.liveHosts = new Map();
@@ -41,15 +44,25 @@ class TransferBackend {
   async ready() {
     await fs.promises.mkdir(this.baseDir, { recursive: true });
     await fs.promises.mkdir(this.metadataDir, { recursive: true });
+    await fs.promises.mkdir(this.inviteCacheDir, { recursive: true });
     this.store = new Corestore(path.join(this.baseDir, "corestore"));
+    this.inviteStore = new Corestore(
+      path.join(this.inviteCacheDir, "corestore"),
+    );
     await this.store.ready();
+    await this.inviteStore.ready();
     const keyPair = await this.store.createKeyPair("peardrops-swarm");
     this.swarm = new Hyperswarm({ keyPair, ...this.swarmOptions });
     this.swarm.on("connection", (socket) => {
       attachSocketErrorHandler(socket);
-      const replication = this.store.replicate(socket);
-      if (replication && typeof replication.on === "function") {
-        replication.on("error", (error) => onBenignConnectionError(error));
+      const replications = [
+        this.store?.replicate?.(socket),
+        this.inviteStore?.replicate?.(socket),
+      ];
+      for (const replication of replications) {
+        if (replication && typeof replication.on === "function") {
+          replication.on("error", (error) => onBenignConnectionError(error));
+        }
       }
     });
     this.flockManager = new FlockManager(null, {
@@ -233,6 +246,9 @@ class TransferBackend {
     const { driveKey, roomInvite } = parseInvite(invite);
     const candidates = [];
 
+    // Prefer explicit drive keys first; room rendezvous may be stale after host restarts.
+    if (driveKey) candidates.push(driveKey);
+
     if (roomInvite) {
       try {
         const flock = await this._attachFlock(roomInvite);
@@ -246,8 +262,6 @@ class TransferBackend {
       }
     }
 
-    if (driveKey) candidates.push(driveKey);
-
     const uniqueCandidates = [...new Set(candidates.filter(Boolean))];
     if (uniqueCandidates.length === 0) {
       throw new Error("Invite does not contain a usable drive key");
@@ -259,7 +273,7 @@ class TransferBackend {
         console.log(
           `[transfer-backend] trying manifest key ${String(key).slice(0, 12)}...`,
         );
-        const drive = await this._attachDrive(key);
+        const drive = await this._attachReadableDrive(key);
         const raw = await this._waitForEntry(drive, "/manifest.json");
         return JSON.parse(raw.toString("utf8"));
       } catch (error) {
@@ -280,7 +294,7 @@ class TransferBackend {
       driveKey,
       roomInvite,
     });
-    const drive = await this._attachDrive(resolvedDriveKey);
+    const drive = await this._attachReadableDrive(resolvedDriveKey);
     const manifest = await this.getManifest({ invite });
 
     await fs.promises.mkdir(targetDir, { recursive: true });
@@ -321,7 +335,7 @@ class TransferBackend {
       driveKey,
       roomInvite,
     });
-    const drive = await this._attachDrive(resolvedDriveKey);
+    const drive = await this._attachReadableDrive(resolvedDriveKey);
     const data = await this._waitForEntry(drive, drivePath);
 
     return {
@@ -341,7 +355,7 @@ class TransferBackend {
       driveKey,
       roomInvite,
     });
-    const drive = await this._attachDrive(resolvedDriveKey);
+    const drive = await this._attachReadableDrive(resolvedDriveKey);
 
     const safeOffset = Math.max(0, Number(offset || 0));
     const safeLength = Math.max(1, Math.min(1024 * 1024, Number(length || 0)));
@@ -376,6 +390,29 @@ class TransferBackend {
     return drive;
   }
 
+  async _attachInviteDrive(driveKeyHex) {
+    if (this.inviteDrives.has(driveKeyHex)) {
+      return this.inviteDrives.get(driveKeyHex);
+    }
+
+    const key = b4a.from(driveKeyHex, "hex");
+    const drive = new Hyperdrive(this.inviteStore, key);
+    await drive.ready();
+    this._ensureDriveDiscovery(driveKeyHex, drive.discoveryKey, {
+      client: true,
+      server: false,
+    });
+    this.inviteDrives.set(driveKeyHex, drive);
+    return drive;
+  }
+
+  async _attachReadableDrive(driveKeyHex) {
+    if (this.liveDrives.has(driveKeyHex)) {
+      return this.liveDrives.get(driveKeyHex);
+    }
+    return this._attachInviteDrive(driveKeyHex);
+  }
+
   _ensureDriveDiscovery(driveKeyHex, discoveryKey, { client, server }) {
     const existing = this.driveDiscoveries.get(driveKeyHex);
     if (!existing) {
@@ -402,13 +439,14 @@ class TransferBackend {
   }
 
   async _resolveDriveKey({ driveKey, roomInvite }) {
+    // Prefer explicit drive keys first for stable/persistent links.
+    if (driveKey) return driveKey;
+
     if (roomInvite) {
       const flock = await this._attachFlock(roomInvite);
       const fromRoom = await this._waitForFlockDriveKey(flock);
       if (fromRoom) return fromRoom;
     }
-
-    if (driveKey) return driveKey;
 
     throw new Error("Invite does not contain a usable drive key");
   }
@@ -573,6 +611,10 @@ class TransferBackend {
       await drive.close();
     }
     this.liveDrives.clear();
+    for (const drive of this.inviteDrives.values()) {
+      await drive.close();
+    }
+    this.inviteDrives.clear();
     for (const entry of this.driveDiscoveries.values()) {
       try {
         await entry?.handle?.destroy?.();
@@ -580,8 +622,10 @@ class TransferBackend {
     }
     this.driveDiscoveries.clear();
     await this.swarm?.destroy();
+    await this.inviteStore?.close();
     await this.store?.close();
     await this.persistence.close();
+    await removeDirectorySafe(this.inviteCacheDir);
   }
 
   async _createWebHostForDrive(drive) {
@@ -591,7 +635,9 @@ class TransferBackend {
 
     if (this.webHosts.has(topicHex)) return { topicHex };
 
-    const keyPair = await this.store.createKeyPair(`peardrops-web-${driveKeyHex}`);
+    const keyPair = await this.store.createKeyPair(
+      `peardrops-web-${driveKeyHex}`,
+    );
     const swarm = new Hyperswarm({
       keyPair,
       ...this.swarmOptions,
@@ -831,6 +877,22 @@ function formatHostSessionLabel(baseName) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function removeDirectorySafe(dirPath) {
+  const target = String(dirPath || "").trim();
+  if (!target) return;
+  try {
+    if (typeof fs.promises.rm === "function") {
+      await fs.promises.rm(target, { recursive: true, force: true });
+      return;
+    }
+  } catch {}
+  try {
+    if (typeof fs.promises.rmdir === "function") {
+      await fs.promises.rmdir(target, { recursive: true });
+    }
+  } catch {}
 }
 
 function withTimeout(promise, ms, message) {
