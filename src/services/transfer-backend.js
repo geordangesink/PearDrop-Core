@@ -213,7 +213,9 @@ class TransferBackend {
   }
 
   async startHostFromTransfer({ transferId, sessionName = "" }) {
-    const transfer = await this.persistence.getTransferById(transferId);
+    const normalizedTransferId = String(transferId || "").trim();
+    const transfer =
+      await this._resolveTransferForRestart(normalizedTransferId);
     if (!transfer) throw new Error("Transfer not found");
     if (!transfer.driveKey) {
       throw new Error("Transfer does not include a drive key");
@@ -261,6 +263,22 @@ class TransferBackend {
       persistTransfer: false,
       existingTransfer: transfer,
     });
+  }
+
+  async _resolveTransferForRestart(transferId) {
+    const key = String(transferId || "").trim();
+    if (!key) return null;
+
+    const byPrimaryId = await this.persistence.getTransferById(key);
+    if (byPrimaryId) return byPrimaryId;
+
+    // Backward compatibility:
+    // some callers persist transfer.transferId while persistence uses record.id as primary key.
+    const all = await this.persistence.listTransfers();
+    const byTransferId = all.find(
+      (record) => String(record?.transferId || "").trim() === key,
+    );
+    return byTransferId || null;
   }
 
   async getManifest({
