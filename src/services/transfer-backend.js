@@ -583,20 +583,48 @@ class TransferBackend {
     await flock.set("peardrops/drive-key", driveKeyHex);
     this.liveFlocks.set(flock.invite, flock);
 
-    const resolvedNativeInvite =
-      String(nativeInvite || "").trim() ||
-      createInvite({
-        driveKey: driveKeyHex,
-        roomInvite: flock.invite,
-        topic: webHost.topicHex,
-        webKey: webHost.hostPublicKey,
-        relayUrl: this.relayUrl,
-        app: "native",
-      });
+    let parsedNativeInvite = null;
+    if (String(nativeInvite || "").trim()) {
+      try {
+        parsedNativeInvite = parseInvite(nativeInvite);
+      } catch {}
+    }
+
+    const relayForLinks =
+      String(parsedNativeInvite?.relayUrl || "").trim() ||
+      String(this.relayUrl || "").trim();
+    const topicForLinks =
+      String(parsedNativeInvite?.topic || "").trim() ||
+      String(webHost.topicHex || "").trim();
+    const roomForInvite =
+      String(parsedNativeInvite?.roomInvite || "").trim() ||
+      String(flock.invite || "").trim();
+    const driveForInvite =
+      String(parsedNativeInvite?.driveKey || "").trim() ||
+      String(driveKeyHex || "").trim();
+    const inviteApp = (() => {
+      const requested = String(parsedNativeInvite?.app || "native")
+        .trim()
+        .toLowerCase();
+      return requested === "web" ? "native" : requested || "native";
+    })();
+
+    // Keep web host key authoritative from the currently-running web swarm host.
+    const webKeyForLinks = String(webHost.hostPublicKey || "").trim();
+
+    const resolvedNativeInvite = createInvite({
+      driveKey: driveForInvite,
+      roomInvite: roomForInvite,
+      topic: topicForLinks,
+      webKey: webKeyForLinks,
+      relayUrl: relayForLinks,
+      app: inviteApp,
+    });
+
     const webSwarmLink = createInvite({
-      topic: webHost.topicHex,
-      relayUrl: this.relayUrl,
-      webKey: webHost.hostPublicKey,
+      topic: topicForLinks,
+      relayUrl: relayForLinks,
+      webKey: webKeyForLinks,
       app: "web",
     }).replace("peardrops://invite", "peardrops-web://join");
 
