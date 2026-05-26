@@ -13,6 +13,7 @@ const RpcCommand = {
   START_HOST_FROM_TRANSFER: 9,
   READ_ENTRY_CHUNK: 10,
   UPDATE_ACTIVE_HOST: 11,
+  LIST_HOST_PEER_ACTIVITY: 12,
 };
 
 function createRpcServer(ipc, handlers) {

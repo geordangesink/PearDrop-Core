@@ -1,6 +1,7 @@
 let PearRuntime = null;
 const { overrideApplyUpdate } = require("./pear-runtime-updater-override");
 const UPDATE_APPLIED_TOKEN = "__PEARDROP_UPDATE_APPLIED__";
+const UPDATE_READY_TOKEN = "__PEARDROP_UPDATE_READY__";
 
 try {
   PearRuntime = require("#pear");
@@ -16,6 +17,7 @@ class UpdaterWorker {
     this.updater = null;
     this._onUpdated = null;
     this._onError = null;
+    this._applyPromise = null;
   }
 
   isEnabled() {
@@ -60,22 +62,11 @@ class UpdaterWorker {
     };
 
     this._onUpdated = async () => {
-      if (!this.updater || typeof this.updater.applyUpdate !== "function") {
+      if (this._shouldApplyOnClose()) {
+        console.log(UPDATE_READY_TOKEN);
         return;
       }
-      try {
-        if (
-          !this.updater.updated ||
-          this.updater.applied ||
-          !this.updater.bundled
-        ) {
-          return;
-        }
-        await this.updater.applyUpdate();
-        console.log(UPDATE_APPLIED_TOKEN);
-      } catch (error) {
-        console.error("[peardrops:updater] apply update failed", error);
-      }
+      await this._applyPendingUpdate("updated");
     };
 
     this.updater.on("error", this._onError);
@@ -83,6 +74,10 @@ class UpdaterWorker {
   }
 
   async close() {
+    if (this._shouldApplyOnClose()) {
+      await this._applyPendingUpdate("close");
+    }
+
     if (this.updater && typeof this.updater.off === "function") {
       if (this._onError) this.updater.off("error", this._onError);
       if (this._onUpdated) this.updater.off("updated", this._onUpdated);
@@ -97,9 +92,57 @@ class UpdaterWorker {
     }
     this.pear = null;
   }
+
+  _isWindowsPlatform() {
+    const platform = String(this.config?.platform || "")
+      .trim()
+      .toLowerCase();
+    if (platform.startsWith("win")) return true;
+    return Boolean(this.config?.squirrel);
+  }
+
+  _shouldApplyOnClose() {
+    return this._isWindowsPlatform();
+  }
+
+  async _applyPendingUpdate(reason = "unknown") {
+    if (!this.updater || typeof this.updater.applyUpdate !== "function") return;
+
+    if (
+      !this.updater.updated ||
+      this.updater.applied ||
+      !this.updater.bundled
+    ) {
+      return;
+    }
+
+    if (this._applyPromise) {
+      await this._applyPromise;
+      return;
+    }
+
+    this._applyPromise = (async () => {
+      try {
+        await this.updater.applyUpdate();
+        console.log(UPDATE_APPLIED_TOKEN);
+      } catch (error) {
+        console.error(
+          `[peardrops:updater] apply update failed (${reason})`,
+          error,
+        );
+      }
+    })();
+
+    try {
+      await this._applyPromise;
+    } finally {
+      this._applyPromise = null;
+    }
+  }
 }
 
 module.exports = {
   UpdaterWorker,
   UPDATE_APPLIED_TOKEN,
+  UPDATE_READY_TOKEN,
 };

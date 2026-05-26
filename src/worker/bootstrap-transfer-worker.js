@@ -142,6 +142,8 @@ async function bootstrapTransferWorker({
       guard(() => backend.startHostFromTransfer(payload)),
     [RpcCommand.UPDATE_ACTIVE_HOST]: (payload) =>
       guard(() => backend.updateActiveHost(payload)),
+    [RpcCommand.LIST_HOST_PEER_ACTIVITY]: () =>
+      guard(() => backend.listHostPeerActivity()),
   });
 
   return { backend, updaterWorker, close };
