@@ -41,6 +41,9 @@ class TransferBackend {
     this.flockManager = null;
     this.uploadProgress =
       typeof uploadProgress === "function" ? uploadProgress : null;
+    this.hostPeerActivity = new Map();
+    this.hostPeerEvents = [];
+    this.hostPeerEventSeq = 0;
   }
 
   async ready() {
@@ -164,6 +167,15 @@ class TransferBackend {
       }))
       .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
     return { hosts };
+  }
+
+  listHostPeerActivity() {
+    return {
+      peers: Array.from(this.hostPeerActivity.values()).sort(
+        (a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0),
+      ),
+      events: this.hostPeerEvents.splice(0),
+    };
   }
 
   async stopHost({ invite }) {
@@ -1041,6 +1053,18 @@ class TransferBackend {
 
   _handleWebTransferSocket(socket, drive) {
     let buffered = "";
+    const peerKeyHex = safeHex(socket?.remotePublicKey || socket?.publicKey);
+    const host = this._findLiveHostByDriveKey(drive?.key?.toString("hex"));
+    if (host) {
+      this._upsertHostPeer({
+        invite: host.invite,
+        sessionName: host.sessionName,
+        peerKeyHex,
+        peerName: "",
+        status: "started",
+        progress: 0,
+      });
+    }
 
     socket.on("data", async (chunk) => {
       buffered += b4a.toString(chunk, "utf8");
@@ -1051,6 +1075,16 @@ class TransferBackend {
         if (line) await this._handleWebRequestLine(socket, drive, line);
         newline = buffered.indexOf("\n");
       }
+    });
+    socket.on("close", () => {
+      if (!host) return;
+      this._upsertHostPeer({
+        invite: host.invite,
+        sessionName: host.sessionName,
+        peerKeyHex,
+        peerName: "",
+        status: "aborted",
+      });
     });
   }
 
@@ -1066,9 +1100,26 @@ class TransferBackend {
     const send = (payload) => {
       socket.write(b4a.from(`${JSON.stringify({ id, ...payload })}\n`, "utf8"));
     };
+    const host = this._findLiveHostByDriveKey(drive?.key?.toString("hex"));
+    const peerKeyHex =
+      safeHex(request?.peerKey) ||
+      safeHex(socket?.remotePublicKey || socket?.publicKey);
+    const peerName = String(request?.peerName || "").trim();
+    const notePeer = (status, progress) => {
+      if (!host) return;
+      this._upsertHostPeer({
+        invite: host.invite,
+        sessionName: host.sessionName,
+        peerKeyHex,
+        peerName,
+        status,
+        progress,
+      });
+    };
 
     try {
       if (request.type === "manifest") {
+        notePeer("started", 0);
         const raw = await this._waitForEntry(drive, "/manifest.json");
         send({
           ok: true,
@@ -1083,6 +1134,7 @@ class TransferBackend {
           throw new Error("Invalid file path");
         }
         const data = await this._waitForEntry(drive, drivePath);
+        notePeer("downloading");
         send({
           ok: true,
           dataBase64: b4a.toString(data, "base64"),
@@ -1101,6 +1153,15 @@ class TransferBackend {
           Math.min(1024 * 1024, Number(request.length || 0)),
         );
         const bytes = await readDriveChunk(drive, drivePath, offset, length);
+        const approxProgress = Math.max(
+          0,
+          Math.min(1, (offset + Number(bytes.byteLength || 0)) / Math.max(1, Number(request.fileSize || 0))),
+        );
+        if (Number.isFinite(approxProgress) && approxProgress > 0) {
+          notePeer("downloading", approxProgress);
+        } else {
+          notePeer("downloading");
+        }
         send({
           ok: true,
           offset,
@@ -1110,12 +1171,77 @@ class TransferBackend {
         return;
       }
 
+      if (request.type === "complete") {
+        notePeer("completed", 1);
+        send({ ok: true });
+        return;
+      }
+
+      if (request.type === "abort") {
+        notePeer("aborted");
+        send({ ok: true });
+        return;
+      }
+
       throw new Error("Unknown request type");
     } catch (error) {
+      notePeer("aborted");
       send({
         ok: false,
         error: error.message || String(error),
       });
+    }
+  }
+
+  _findLiveHostByDriveKey(driveKeyHex) {
+    const key = String(driveKeyHex || "").trim();
+    if (!key) return null;
+    return (
+      Array.from(this.liveHosts.values()).find(
+        (item) => String(item?.driveKey || "").trim() === key,
+      ) || null
+    );
+  }
+
+  _upsertHostPeer({
+    invite = "",
+    sessionName = "",
+    peerKeyHex = "",
+    peerName = "",
+    status = "downloading",
+    progress,
+  }) {
+    const normalizedInvite = String(invite || "").trim();
+    const normalizedPeerKey = safeHex(peerKeyHex);
+    if (!normalizedInvite || !normalizedPeerKey) return;
+    const id = `${normalizedInvite}:${normalizedPeerKey}`;
+    const now = Date.now();
+    const existing = this.hostPeerActivity.get(id) || {};
+    const normalizedName = String(peerName || "").trim();
+    const nextProgress = Number(progress);
+    const updated = {
+      id,
+      invite: normalizedInvite,
+      sessionName: String(sessionName || existing.sessionName || "Host Session"),
+      peerKeyHex: normalizedPeerKey,
+      peerHex4: normalizedPeerKey.slice(0, 4),
+      peerName: normalizedName || existing.peerName || "Unknown",
+      status: String(status || existing.status || "downloading"),
+      progress:
+        Number.isFinite(nextProgress) && nextProgress >= 0
+          ? Math.max(0, Math.min(1, nextProgress))
+          : Number(existing.progress || 0),
+      updatedAt: now,
+    };
+    this.hostPeerActivity.set(id, updated);
+    this.hostPeerEventSeq += 1;
+    this.hostPeerEvents.push({
+      eventId: this.hostPeerEventSeq,
+      type: updated.status,
+      ...updated,
+    });
+    if (this.hostPeerEvents.length > 400) {
+      this.hostPeerEvents.splice(0, this.hostPeerEvents.length - 400);
     }
   }
 
@@ -1212,6 +1338,20 @@ function sanitizeDrivePath(value) {
     .split("/")
     .map((part, index) => (index === 0 ? "" : sanitizeName(part)))
     .join("/");
+}
+
+function safeHex(value) {
+  if (!value) return "";
+  try {
+    if (typeof value === "string") {
+      const cleaned = value.trim().toLowerCase();
+      return /^[0-9a-f]+$/.test(cleaned) ? cleaned : "";
+    }
+    if (b4a.isBuffer(value) || value instanceof Uint8Array) {
+      return b4a.toString(value, "hex");
+    }
+  } catch {}
+  return "";
 }
 
 async function readUploadFile(sourcePath) {
