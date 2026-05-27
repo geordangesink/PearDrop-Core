@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1
+
+- add raw or zip indicator
+
 ## 0.8.0
 
 - Add host peer activity APIs/events and shared joining-peers state.
