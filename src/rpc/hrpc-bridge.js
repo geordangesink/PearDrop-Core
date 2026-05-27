@@ -14,6 +14,8 @@ const RpcCommand = {
   READ_ENTRY_CHUNK: 10,
   UPDATE_ACTIVE_HOST: 11,
   LIST_HOST_PEER_ACTIVITY: 12,
+  REPORT_HOST_PEER_EVENT: 13,
+  SET_PEER_PROFILE: 14,
 };
 
 function createRpcServer(ipc, handlers) {

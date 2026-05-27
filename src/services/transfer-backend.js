@@ -6,6 +6,7 @@ const Hyperswarm = require("hyperswarm");
 const FlockManager = require("flockmanager");
 const DHT = require("@hyperswarm/dht-relay");
 const RelayStream = require("@hyperswarm/dht-relay/ws");
+const z32 = require("z32");
 const { HyperdbPersistence } = require("../persistence/hyperdb-persistence");
 const { createInvite, parseInvite } = require("../utils/invite");
 
@@ -29,6 +30,7 @@ class TransferBackend {
     this.store = null;
     this.inviteStore = null;
     this.swarm = null;
+    this.controlSwarm = null;
     this.metadataDir = metadataDir || path.join(baseDir, "db");
     this.inviteCacheDir = path.join(baseDir, "invite-cache");
     this.persistence = new HyperdbPersistence(this.metadataDir);
@@ -44,6 +46,9 @@ class TransferBackend {
     this.hostPeerActivity = new Map();
     this.hostPeerEvents = [];
     this.hostPeerEventSeq = 0;
+    this.peerProfile = {};
+    this.peerControlChannels = new Map();
+    this.hostControlTopics = new Map();
   }
 
   async ready() {
@@ -69,6 +74,17 @@ class TransferBackend {
           replication.on("error", (error) => onBenignConnectionError(error));
         }
       }
+    });
+    const controlKeyPair = await this.store.createKeyPair(
+      "peardrops-control-swarm",
+    );
+    this.controlSwarm = new Hyperswarm({
+      keyPair: controlKeyPair,
+      ...this.swarmOptions,
+    });
+    this.controlSwarm.on("connection", (socket, info) => {
+      attachSocketErrorHandler(socket);
+      this._handleControlConnection(socket, info);
     });
     this.flockManager = new FlockManager(null, {
       swarm: this.swarm,
@@ -172,10 +188,56 @@ class TransferBackend {
   listHostPeerActivity() {
     return {
       peers: Array.from(this.hostPeerActivity.values()).sort(
-        (a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0),
+        (a, b) =>
+          Number(b.createdAt || b.updatedAt || 0) -
+          Number(a.createdAt || a.updatedAt || 0),
       ),
       events: this.hostPeerEvents.splice(0),
     };
+  }
+
+  async reportHostPeerEvent({
+    invite = "",
+    sessionName = "",
+    peerKeyHex = "",
+    peerName = "",
+    type = "downloading",
+    progress,
+  } = {}) {
+    const normalizedInvite = String(invite || "").trim();
+    const localHost = normalizedInvite
+      ? this.liveHosts.get(normalizedInvite)
+      : null;
+    if (localHost) {
+      this._upsertHostPeer({
+        invite: normalizedInvite,
+        sessionName: String(
+          sessionName || localHost.sessionName || "Host Session",
+        ),
+        peerKeyHex,
+        peerName,
+        status: type,
+        progress,
+      });
+    }
+    await this._sendPeerControlEvent({
+      invite,
+      sessionName,
+      peerKeyHex,
+      peerName,
+      type,
+      progress,
+    });
+    return { ok: true };
+  }
+
+  async setPeerProfile({ name = "" } = {}) {
+    const peerName = String(name || "").trim();
+    this.peerProfile = peerName ? { name: peerName } : {};
+    try {
+      await this.flockManager?.setUserData?.(this.peerProfile);
+    } catch {}
+    return { ok: true, peerProfile: this.peerProfile };
   }
 
   async stopHost({ invite }) {
@@ -194,12 +256,25 @@ class TransferBackend {
 
     let closeError = null;
     try {
+      this._stopHostMemberTracking(host);
+      if (
+        host._peerEnteredBound &&
+        host._peerEnteredHandler &&
+        typeof host.flock?.off === "function"
+      ) {
+        try {
+          host.flock.off("peerEntered", host._peerEnteredHandler);
+        } catch {}
+      }
       if (host.flock && typeof host.flock.close === "function") {
         await host.flock.close();
       }
     } catch (error) {
       closeError = error || new Error("Failed closing host flock");
     } finally {
+      if (host.controlTopicHex) {
+        this.hostControlTopics.delete(host.controlTopicHex);
+      }
       this.liveFlocks.delete(host.roomInvite);
       this.liveHosts.delete(host.invite);
 
@@ -559,7 +634,7 @@ class TransferBackend {
     return drive;
   }
 
-  async _attachReadableDrive(driveKeyHex) {
+  _attachReadableDrive(driveKeyHex) {
     if (this.liveDrives.has(driveKeyHex)) {
       return this.liveDrives.get(driveKeyHex);
     }
@@ -761,6 +836,11 @@ class TransferBackend {
       topicHex: webHost.topicHex,
       webSwarmLink,
     });
+    await this._ensureHostControlChannel(
+      this.liveHosts.get(resolvedNativeInvite),
+    );
+    this._bindHostFlockPeerEvents(this.liveHosts.get(resolvedNativeInvite));
+    this._startHostMemberTracking(this.liveHosts.get(resolvedNativeInvite));
 
     return {
       invite: resolvedNativeInvite,
@@ -968,12 +1048,16 @@ class TransferBackend {
         host?.flock && typeof host.flock.close === "function";
       const flockClosed = host?.flock?.closed === true;
       if (hasFlockCloser && !flockClosed) continue;
+      this._stopHostMemberTracking(host);
       this.liveFlocks.delete(host?.roomInvite);
       this.liveHosts.delete(host?.invite);
     }
   }
 
   async close() {
+    for (const host of this.liveHosts.values()) {
+      this._stopHostMemberTracking(host);
+    }
     for (const flock of this.liveFlocks.values()) {
       await flock.close();
     }
@@ -999,6 +1083,19 @@ class TransferBackend {
       } catch {}
     }
     this.driveDiscoveries.clear();
+    for (const channel of this.peerControlChannels.values()) {
+      try {
+        await channel?.handle?.destroy?.();
+      } catch {}
+      for (const socket of channel?.sockets || []) {
+        try {
+          socket.destroy();
+        } catch {}
+      }
+    }
+    this.peerControlChannels.clear();
+    this.hostControlTopics.clear();
+    await this.controlSwarm?.destroy();
     await this.swarm?.destroy();
     await this.inviteStore?.close();
     await this.store?.close();
@@ -1134,7 +1231,7 @@ class TransferBackend {
           throw new Error("Invalid file path");
         }
         const data = await this._waitForEntry(drive, drivePath);
-        notePeer("downloading");
+        notePeer("joined");
         send({
           ok: true,
           dataBase64: b4a.toString(data, "base64"),
@@ -1153,14 +1250,22 @@ class TransferBackend {
           Math.min(1024 * 1024, Number(request.length || 0)),
         );
         const bytes = await readDriveChunk(drive, drivePath, offset, length);
-        const approxProgress = Math.max(
-          0,
-          Math.min(1, (offset + Number(bytes.byteLength || 0)) / Math.max(1, Number(request.fileSize || 0))),
-        );
-        if (Number.isFinite(approxProgress) && approxProgress > 0) {
-          notePeer("downloading", approxProgress);
+        const requestedFileSize = Math.max(0, Number(request.fileSize || 0));
+        if (requestedFileSize > 0) {
+          const approxProgress = Math.max(
+            0,
+            Math.min(
+              1,
+              (offset + Number(bytes.byteLength || 0)) / requestedFileSize,
+            ),
+          );
+          if (Number.isFinite(approxProgress) && approxProgress > 0) {
+            notePeer("downloading", approxProgress);
+          } else {
+            notePeer("downloading");
+          }
         } else {
-          notePeer("downloading");
+          notePeer("joined", 0);
         }
         send({
           ok: true,
@@ -1213,26 +1318,118 @@ class TransferBackend {
   }) {
     const normalizedInvite = String(invite || "").trim();
     const normalizedPeerKey = safeHex(peerKeyHex);
-    if (!normalizedInvite || !normalizedPeerKey) return;
-    const id = `${normalizedInvite}:${normalizedPeerKey}`;
-    const now = Date.now();
-    const existing = this.hostPeerActivity.get(id) || {};
     const normalizedName = String(peerName || "").trim();
+    const normalizedStatus = String(status || "")
+      .trim()
+      .toLowerCase();
+    if (!normalizedInvite) return;
+    if (normalizedStatus === "aborted" || normalizedStatus === "left") {
+      if (normalizedPeerKey) {
+        this._removeHostPeer({
+          invite: normalizedInvite,
+          peerKeyHex: normalizedPeerKey,
+        });
+        return;
+      }
+      if (normalizedName) {
+        this._removeHostPeerByName({
+          invite: normalizedInvite,
+          peerName: normalizedName,
+        });
+        return;
+      }
+    }
+    const now = Date.now();
     const nextProgress = Number(progress);
+    let existing = null;
+    let id = "";
+    if (normalizedPeerKey) {
+      id = `${normalizedInvite}:${normalizedPeerKey}`;
+      existing = this.hostPeerActivity.get(id) || null;
+      if (!existing && normalizedName) {
+        existing =
+          Array.from(this.hostPeerActivity.values()).find(
+            (item) =>
+              String(item?.invite || "") === normalizedInvite &&
+              String(item?.peerName || "").trim() === normalizedName,
+          ) || null;
+      }
+    } else if (normalizedName) {
+      existing =
+        Array.from(this.hostPeerActivity.values()).find(
+          (item) =>
+            String(item?.invite || "") === normalizedInvite &&
+            String(item?.peerName || "").trim() === normalizedName,
+        ) || null;
+      if (!existing) {
+        id = `${normalizedInvite}:name:${normalizedName.toLowerCase()}`;
+      } else {
+        id = String(existing.id || "").trim();
+      }
+    } else {
+      return;
+    }
+    if (!id) return;
+    const existingKeyHex = String(existing?.peerKeyHex || "").trim();
+    const resolvedKeyHex = normalizedPeerKey || existingKeyHex;
+    const resolvedHex4 = resolvedKeyHex
+      ? resolvedKeyHex.slice(0, 4)
+      : String(existing?.peerHex4 || "").trim();
+    const incomingStatus = String(status || existing?.status || "downloading");
+    const previousStatus = String(existing?.status || "");
+    const shouldPreserveActiveStatus =
+      incomingStatus === "joined" &&
+      (previousStatus === "downloading" || previousStatus === "completed");
+    const resolvedStatus = shouldPreserveActiveStatus
+      ? previousStatus
+      : incomingStatus;
     const updated = {
       id,
       invite: normalizedInvite,
-      sessionName: String(sessionName || existing.sessionName || "Host Session"),
-      peerKeyHex: normalizedPeerKey,
-      peerHex4: normalizedPeerKey.slice(0, 4),
-      peerName: normalizedName || existing.peerName || "Unknown",
-      status: String(status || existing.status || "downloading"),
+      sessionName: String(
+        sessionName || existing?.sessionName || "Host Session",
+      ),
+      peerKeyHex: resolvedKeyHex,
+      peerHex4: resolvedHex4,
+      peerName: normalizedName || existing?.peerName || "Unknown",
+      status: resolvedStatus,
       progress:
         Number.isFinite(nextProgress) && nextProgress >= 0
           ? Math.max(0, Math.min(1, nextProgress))
-          : Number(existing.progress || 0),
+          : Number(existing?.progress || 0),
+      createdAt: Number(existing?.createdAt || now),
       updatedAt: now,
     };
+    if (existing) {
+      const sameSession =
+        String(existing.sessionName || "") ===
+        String(updated.sessionName || "");
+      const sameKey =
+        String(existing.peerKeyHex || "") === String(updated.peerKeyHex || "");
+      const sameHex4 =
+        String(existing.peerHex4 || "") === String(updated.peerHex4 || "");
+      const sameName =
+        String(existing.peerName || "") === String(updated.peerName || "");
+      const sameStatus =
+        String(existing.status || "") === String(updated.status || "");
+      const sameProgress =
+        Math.abs(
+          Number(existing.progress || 0) - Number(updated.progress || 0),
+        ) < 0.001;
+      if (
+        sameSession &&
+        sameKey &&
+        sameHex4 &&
+        sameName &&
+        sameStatus &&
+        sameProgress
+      ) {
+        return;
+      }
+    }
+    if (existing && String(existing?.id || "") && String(existing.id) !== id) {
+      this.hostPeerActivity.delete(String(existing.id));
+    }
     this.hostPeerActivity.set(id, updated);
     this.hostPeerEventSeq += 1;
     this.hostPeerEvents.push({
@@ -1243,6 +1440,417 @@ class TransferBackend {
     if (this.hostPeerEvents.length > 400) {
       this.hostPeerEvents.splice(0, this.hostPeerEvents.length - 400);
     }
+  }
+
+  _bindHostFlockPeerEvents(host) {
+    if (!host || !host.flock || typeof host.flock.on !== "function") return;
+    if (host._peerEnteredBound) return;
+    host._peerEnteredBound = true;
+    host._peerEnteredHandler = (peerId) => {
+      void this._handleHostPeerEntered(host, peerId);
+    };
+    host.flock.on("peerEntered", host._peerEnteredHandler);
+  }
+
+  async _ensureHostControlChannel(host) {
+    if (!host) return;
+    const roomInvite = String(host.roomInvite || "").trim();
+    if (!roomInvite) return;
+    let topicHex = String(host.controlTopicHex || "").trim();
+    if (!topicHex) {
+      topicHex = await this._resolveControlTopicHexForRoomInvite(roomInvite);
+      if (!topicHex) return;
+      host.controlTopicHex = topicHex;
+      this.liveHosts.set(host.invite, host);
+    }
+    if (this.hostControlTopics.get(topicHex) !== host.invite) {
+      this.hostControlTopics.set(topicHex, host.invite);
+    }
+    if (this.peerControlChannels.has(topicHex)) return;
+    const topic = b4a.from(topicHex, "hex");
+    const handle = this.controlSwarm.join(topic, {
+      server: true,
+      client: true,
+    });
+    this.peerControlChannels.set(topicHex, {
+      topicHex,
+      handle,
+      sockets: new Set(),
+      pending: [],
+    });
+    try {
+      await handle.flushed();
+    } catch {}
+  }
+
+  _resolveControlTopicHexForRoomInvite(roomInvite) {
+    const normalized = String(roomInvite || "").trim();
+    if (!normalized) return "";
+    const flock = this.liveFlocks.get(normalized);
+    if (flock?.autobee?.discoveryKey) {
+      return b4a.toString(
+        derivePeerActivityTopic(flock.autobee.discoveryKey),
+        "hex",
+      );
+    }
+    return "";
+  }
+
+  _handleControlConnection(socket, info) {
+    const topics = Array.isArray(info?.topics) ? info.topics : [];
+    const socketTopics = topics.map((topic) =>
+      b4a.toString(b4a.from(topic), "hex"),
+    );
+    const matchedTopic = socketTopics.find((topicHex) =>
+      this.peerControlChannels.has(topicHex),
+    );
+    let channel = matchedTopic
+      ? this.peerControlChannels.get(matchedTopic)
+      : null;
+    const attachSocketToChannel = (topicHex) => {
+      const normalized = safeHex(topicHex);
+      if (!normalized) return null;
+      const target = this.peerControlChannels.get(normalized);
+      if (!target) return null;
+      target?.sockets?.add?.(socket);
+      if (Array.isArray(target?.pending) && target.pending.length > 0) {
+        const queued = target.pending.splice(0);
+        for (const queuedMessage of queued) {
+          try {
+            socket.write(queuedMessage);
+          } catch {}
+        }
+      }
+      return target;
+    };
+    if (channel) {
+      attachSocketToChannel(channel.topicHex);
+    }
+    const peerKeyHex = safeHex(socket?.remotePublicKey || socket?.publicKey);
+    const socketState = {
+      hostInvite: "",
+      peerName: "",
+      peerKeyHex: "",
+    };
+
+    let buffered = "";
+    socket.on("data", (chunk) => {
+      buffered += String(b4a.toString(chunk, "utf8") || "");
+      let newline = buffered.indexOf("\n");
+      const lines = [];
+      while (newline !== -1) {
+        const line = buffered.slice(0, newline).trim();
+        buffered = buffered.slice(newline + 1);
+        if (line) lines.push(line);
+        newline = buffered.indexOf("\n");
+      }
+      for (const line of lines) {
+        let message = null;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const fromInvite = String(message?.invite || "").trim();
+        const fromTopicHex = safeHex(message?.topicHex);
+        if (!channel && fromTopicHex) {
+          channel = attachSocketToChannel(fromTopicHex);
+        }
+        const hostInvite =
+          (fromInvite && this.liveHosts.has(fromInvite) && fromInvite) ||
+          (fromTopicHex && this.hostControlTopics.get(fromTopicHex)) ||
+          (matchedTopic && this.hostControlTopics.get(matchedTopic)) ||
+          "";
+        if (!hostInvite || !this.liveHosts.has(hostInvite)) continue;
+        const host = this.liveHosts.get(hostInvite);
+        if (!host) continue;
+        socketState.hostInvite = hostInvite;
+        socketState.peerName = String(message?.peerName || "").trim();
+        const stablePeerKeyHex = safeHex(message?.peerStableKeyHex);
+        socketState.peerKeyHex =
+          stablePeerKeyHex ||
+          safeHex(message?.peerKeyHex) ||
+          socketState.peerKeyHex ||
+          peerKeyHex;
+        this._upsertHostPeer({
+          invite: hostInvite,
+          sessionName: String(message?.sessionName || host.sessionName || ""),
+          peerKeyHex: socketState.peerKeyHex,
+          peerName: String(message?.peerName || "").trim(),
+          status: String(message?.type || "downloading").trim(),
+          progress: Number(message?.progress),
+        });
+      }
+    });
+    socket.on("close", () => {
+      for (const existingChannel of this.peerControlChannels.values()) {
+        existingChannel?.sockets?.delete?.(socket);
+      }
+      const hostInvite =
+        socketState.hostInvite ||
+        (matchedTopic && this.hostControlTopics.get(matchedTopic)) ||
+        "";
+      if (!hostInvite) return;
+      const resolvedPeerKey = socketState.peerKeyHex || peerKeyHex;
+      if (resolvedPeerKey) {
+        this._removeHostPeer({
+          invite: hostInvite,
+          peerKeyHex: resolvedPeerKey,
+        });
+        return;
+      }
+      if (socketState.peerName) {
+        this._removeHostPeerByName({
+          invite: hostInvite,
+          peerName: socketState.peerName,
+        });
+      }
+    });
+  }
+
+  async _sendPeerControlEvent({
+    invite = "",
+    sessionName = "",
+    peerKeyHex = "",
+    peerName = "",
+    type = "downloading",
+    progress,
+  } = {}) {
+    let parsedInvite = null;
+    try {
+      parsedInvite = parseInvite(String(invite || "").trim() || "");
+    } catch {
+      return;
+    }
+    const roomInvite = String(parsedInvite?.roomInvite || "").trim();
+    if (!roomInvite) return;
+    const senderFlock = this.liveFlocks.get(roomInvite);
+    const stablePeerKeyHex = decodePeerIdToHex(String(senderFlock?.myId || ""));
+    const topicHex =
+      await this._resolveControlTopicHexForRoomInvite(roomInvite);
+    if (!topicHex) return;
+    let channel = this.peerControlChannels.get(topicHex);
+    if (!channel) {
+      const topic = b4a.from(topicHex, "hex");
+      const handle = this.controlSwarm.join(topic, {
+        server: false,
+        client: true,
+      });
+      channel = { topicHex, handle, sockets: new Set(), pending: [] };
+      this.peerControlChannels.set(topicHex, channel);
+      try {
+        await handle.flushed();
+      } catch {}
+    }
+    const payload = {
+      type: String(type || "downloading"),
+      invite: String(invite || ""),
+      topicHex,
+      sessionName: String(sessionName || ""),
+      peerKeyHex: safeHex(peerKeyHex),
+      peerStableKeyHex: stablePeerKeyHex,
+      peerName: String(peerName || this.peerProfile?.name || "").trim(),
+      progress: Number(progress),
+    };
+    const message = b4a.from(`${JSON.stringify(payload)}\n`, "utf8");
+    if (channel.sockets.size === 0) {
+      channel.pending.push(message);
+      if (channel.pending.length > 64) {
+        channel.pending.splice(0, channel.pending.length - 64);
+      }
+      return;
+    }
+    for (const socket of channel.sockets) {
+      try {
+        socket.write(message);
+      } catch {}
+    }
+  }
+
+  _startHostMemberTracking(host) {
+    if (!host || host._memberTrackTimer) return;
+    host._knownMemberIds = new Set();
+    const members = host?.flock?.info?.members || {};
+    const myId = String(host?.flock?.myId || "").trim();
+    for (const memberId of Object.keys(members)) {
+      const normalized = String(memberId || "").trim();
+      if (!normalized || (myId && normalized === myId)) continue;
+      host._knownMemberIds.add(normalized);
+    }
+    host._memberTrackTimer = setInterval(() => {
+      try {
+        const current = host?.flock?.info?.members || {};
+        const currentSet = new Set();
+        const ownId = String(host?.flock?.myId || "").trim();
+        for (const memberId of Object.keys(current)) {
+          const normalized = String(memberId || "").trim();
+          if (!normalized || (ownId && normalized === ownId)) continue;
+          currentSet.add(normalized);
+          if (!normalized || host._knownMemberIds.has(normalized)) continue;
+          host._knownMemberIds.add(normalized);
+          void this._handleHostPeerEntered(host, normalized);
+        }
+        for (const knownId of Array.from(host._knownMemberIds || [])) {
+          if (!currentSet.has(knownId)) {
+            host._knownMemberIds.delete(knownId);
+            this._handleHostPeerLeft(host, knownId);
+          }
+        }
+        this._refreshHostPeerNamesFromMembers(host, current);
+      } catch {}
+    }, 350);
+    if (typeof host._memberTrackTimer?.unref === "function") {
+      host._memberTrackTimer.unref();
+    }
+  }
+
+  _stopHostMemberTracking(host) {
+    if (!host) return;
+    if (host._memberTrackTimer) {
+      clearInterval(host._memberTrackTimer);
+      host._memberTrackTimer = null;
+    }
+    host._knownMemberIds = null;
+  }
+
+  async _handleHostPeerEntered(host, peerId) {
+    const peerIdText = String(peerId || "").trim();
+    if (!peerIdText) return;
+    const ownId = String(host?.flock?.myId || "").trim();
+    if (ownId && peerIdText === ownId) return;
+    const peerKeyHex = decodePeerIdToHex(peerIdText);
+    if (this._isPeerSuppressed(host, peerKeyHex)) return;
+    const lookupName = () => {
+      const members = host?.flock?.info?.members || {};
+      const direct = members?.[peerIdText];
+      if (direct) return String(direct?.name || direct?.peerName || "").trim();
+      const targetHex = String(peerKeyHex || "").toLowerCase();
+      if (!targetHex) return "";
+      for (const [memberId, memberData] of Object.entries(members)) {
+        const memberHex = decodePeerIdToHex(String(memberId || ""));
+        if (!memberHex) continue;
+        if (String(memberHex).toLowerCase() === targetHex) {
+          return String(memberData?.name || memberData?.peerName || "").trim();
+        }
+      }
+      return "";
+    };
+    let peerName = lookupName();
+    for (let i = 0; i < 6 && !peerName; i++) {
+      await sleep(120);
+      peerName = lookupName();
+    }
+    this._upsertHostPeer({
+      invite: host.invite,
+      sessionName: host.sessionName,
+      peerKeyHex,
+      peerName,
+      status: "joined",
+      progress: 0,
+    });
+  }
+
+  _handleHostPeerLeft(host, peerId) {
+    const invite = String(host?.invite || "").trim();
+    if (!invite) return;
+    const peerKeyHex = decodePeerIdToHex(String(peerId || ""));
+    this._removeHostPeer({ invite, peerKeyHex });
+  }
+
+  _refreshHostPeerNamesFromMembers(host, membersOverride = null) {
+    const members = membersOverride || host?.flock?.info?.members || {};
+    const invite = String(host?.invite || "").trim();
+    if (!invite) return;
+    for (const [memberId, memberData] of Object.entries(members)) {
+      const normalizedId = String(memberId || "").trim();
+      if (!normalizedId) continue;
+      const ownId = String(host?.flock?.myId || "").trim();
+      if (ownId && normalizedId === ownId) continue;
+      const memberName = String(
+        memberData?.name || memberData?.peerName || "",
+      ).trim();
+      if (!memberName) continue;
+      const peerKeyHex = decodePeerIdToHex(normalizedId);
+      if (this._isPeerSuppressed(host, peerKeyHex)) continue;
+      this._upsertHostPeer({
+        invite,
+        sessionName: host?.sessionName || "Host Session",
+        peerKeyHex,
+        peerName: memberName,
+        status: "joined",
+      });
+    }
+  }
+
+  _removeHostPeer({ invite = "", peerKeyHex = "" }) {
+    const normalizedInvite = String(invite || "").trim();
+    const normalizedPeerKey = safeHex(peerKeyHex);
+    if (!normalizedInvite || !normalizedPeerKey) return;
+    const id = `${normalizedInvite}:${normalizedPeerKey}`;
+    const existing = this.hostPeerActivity.get(id);
+    if (!existing) return;
+    this.hostPeerActivity.delete(id);
+    this._suppressPeerRejoin(
+      this.liveHosts.get(normalizedInvite),
+      normalizedPeerKey,
+    );
+    this.hostPeerEventSeq += 1;
+    this.hostPeerEvents.push({
+      eventId: this.hostPeerEventSeq,
+      type: "left",
+      ...existing,
+    });
+    if (this.hostPeerEvents.length > 400) {
+      this.hostPeerEvents.splice(0, this.hostPeerEvents.length - 400);
+    }
+  }
+
+  _removeHostPeerByName({ invite = "", peerName = "" }) {
+    const normalizedInvite = String(invite || "").trim();
+    const normalizedName = String(peerName || "").trim();
+    if (!normalizedInvite || !normalizedName) return;
+    const existing =
+      Array.from(this.hostPeerActivity.values()).find(
+        (item) =>
+          String(item?.invite || "").trim() === normalizedInvite &&
+          String(item?.peerName || "").trim() === normalizedName,
+      ) || null;
+    if (!existing) return;
+    this.hostPeerActivity.delete(String(existing.id || ""));
+    this._suppressPeerRejoin(
+      this.liveHosts.get(normalizedInvite),
+      String(existing?.peerKeyHex || ""),
+    );
+    this.hostPeerEventSeq += 1;
+    this.hostPeerEvents.push({
+      eventId: this.hostPeerEventSeq,
+      type: "left",
+      ...existing,
+    });
+    if (this.hostPeerEvents.length > 400) {
+      this.hostPeerEvents.splice(0, this.hostPeerEvents.length - 400);
+    }
+  }
+
+  _suppressPeerRejoin(host, peerKeyHex = "") {
+    if (!host) return;
+    const key = safeHex(peerKeyHex);
+    if (!key) return;
+    if (!host._suppressPeerUntil) host._suppressPeerUntil = new Map();
+    host._suppressPeerUntil.set(key, Date.now() + 3000);
+  }
+
+  _isPeerSuppressed(host, peerKeyHex = "") {
+    if (!host || !host._suppressPeerUntil) return false;
+    const key = safeHex(peerKeyHex);
+    if (!key) return false;
+    const until = Number(host._suppressPeerUntil.get(key) || 0);
+    if (!until) return false;
+    if (Date.now() >= until) {
+      host._suppressPeerUntil.delete(key);
+      return false;
+    }
+    return true;
   }
 
   async _writeFilesAndManifest({ drive, files }) {
@@ -1354,6 +1962,19 @@ function safeHex(value) {
   return "";
 }
 
+function decodePeerIdToHex(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const asHex = safeHex(text);
+  if (asHex) return asHex;
+  try {
+    const bytes = z32.decode(text);
+    return b4a.toString(bytes, "hex");
+  } catch {
+    return "";
+  }
+}
+
 async function readUploadFile(sourcePath) {
   const resolved = String(sourcePath || "").trim();
   if (!resolved) {
@@ -1377,6 +1998,15 @@ function deriveWebTopic(discoveryKey) {
   const topic = b4a.from(discoveryKey);
   topic[0] ^= 0x70;
   topic[1] ^= 0x64;
+  return topic;
+}
+
+function derivePeerActivityTopic(discoveryKey) {
+  const topic = b4a.from(discoveryKey);
+  topic[0] ^= 0x50;
+  topic[1] ^= 0x65;
+  topic[2] ^= 0x65;
+  topic[3] ^= 0x72;
   return topic;
 }
 
