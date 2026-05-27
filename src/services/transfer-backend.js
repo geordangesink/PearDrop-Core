@@ -98,7 +98,12 @@ class TransferBackend {
     return this.persistence.listTransfers();
   }
 
-  async createUpload({ files, sessionName = "", nativeInvite = "" }) {
+  async createUpload({
+    files,
+    sessionName = "",
+    nativeInvite = "",
+    hostMode = "raw",
+  }) {
     if (!Array.isArray(files) || files.length === 0) {
       throw new Error("At least one file is required");
     }
@@ -117,11 +122,12 @@ class TransferBackend {
       fileManifest,
       sessionName,
       nativeInvite,
+      hostMode,
     });
     return hosted;
   }
 
-  async updateActiveHost({ invite, files, sessionName = "" }) {
+  async updateActiveHost({ invite, files, sessionName = "", hostMode = "" }) {
     const key = String(invite || "");
     if (!key) throw new Error("Invite is required");
     if (!Array.isArray(files) || files.length === 0) {
@@ -145,6 +151,8 @@ class TransferBackend {
 
     host.fileManifest = fileManifest;
     host.sessionName = nextSessionName;
+    const nextHostMode = normalizeHostMode(hostMode || host.hostMode || "");
+    host.hostMode = nextHostMode;
 
     this.liveHosts.set(host.invite, host);
 
@@ -157,6 +165,7 @@ class TransferBackend {
         invite: host.invite,
         sessionName: host.sessionName,
         sessionLabel: host.sessionLabel || "",
+        hostMode: host.hostMode || "raw",
       },
     };
   }
@@ -172,6 +181,7 @@ class TransferBackend {
         roomInvite: host.roomInvite,
         sessionName: host.sessionName,
         sessionLabel: host.sessionLabel,
+        hostMode: host.hostMode || "raw",
         createdAt: host.createdAt,
         fileCount: host.fileManifest.length,
         totalBytes: host.fileManifest.reduce(
@@ -299,7 +309,7 @@ class TransferBackend {
     };
   }
 
-  async startHostFromTransfer({ transferId, sessionName = "" }) {
+  async startHostFromTransfer({ transferId, sessionName = "", hostMode = "" }) {
     const normalizedTransferId = String(transferId || "").trim();
     const transfer =
       await this._resolveTransferForRestart(normalizedTransferId);
@@ -324,6 +334,7 @@ class TransferBackend {
           sessionName:
             host.sessionName || transfer.sessionName || "Host Session",
           sessionLabel: host.sessionLabel || transfer.sessionLabel || "",
+          hostMode: host.hostMode || transfer.hostMode || "raw",
         },
       };
     }
@@ -339,6 +350,9 @@ class TransferBackend {
     const reusedSessionLabel =
       String(transfer.sessionLabel || "").trim() ||
       formatHostSessionLabel(reusedSessionName);
+    const reusedHostMode = normalizeHostMode(
+      hostMode || transfer.hostMode || "",
+    );
 
     return this._startHostingDrive({
       drive,
@@ -346,6 +360,7 @@ class TransferBackend {
       fileManifest: manifest.files || manifest,
       sessionName: reusedSessionName,
       sessionLabel: reusedSessionLabel,
+      hostMode: reusedHostMode,
       nativeInvite: transfer.invite,
       persistTransfer: false,
       existingTransfer: transfer,
@@ -721,6 +736,7 @@ class TransferBackend {
     fileManifest,
     sessionName = "",
     sessionLabel = "",
+    hostMode = "raw",
     nativeInvite = "",
     persistTransfer = true,
     existingTransfer = null,
@@ -791,6 +807,7 @@ class TransferBackend {
     const hostSessionLabel =
       String(sessionLabel || "").trim() ||
       formatHostSessionLabel(hostSessionName);
+    const normalizedHostMode = normalizeHostMode(hostMode || "");
     const createdAt = Date.now();
     const persisted = persistTransfer
       ? await this.persistence.appendTransfer({
@@ -805,6 +822,7 @@ class TransferBackend {
           ),
           sessionName: hostSessionName,
           sessionLabel: hostSessionLabel,
+          hostMode: normalizedHostMode,
           manifest: fileManifest,
         })
       : existingTransfer || {
@@ -819,6 +837,7 @@ class TransferBackend {
           ),
           sessionName: hostSessionName,
           sessionLabel: hostSessionLabel,
+          hostMode: normalizedHostMode,
           manifest: fileManifest,
           createdAt,
         };
@@ -830,6 +849,7 @@ class TransferBackend {
       roomInvite: flock.invite,
       sessionName: hostSessionName,
       sessionLabel: hostSessionLabel,
+      hostMode: normalizedHostMode,
       createdAt,
       fileManifest,
       flock,
@@ -852,6 +872,7 @@ class TransferBackend {
         invite: resolvedNativeInvite,
         sessionName: hostSessionName,
         sessionLabel: hostSessionLabel,
+        hostMode: normalizedHostMode,
       },
     };
   }
@@ -2032,6 +2053,13 @@ function formatHostSessionLabel(baseName) {
     .toString(16)
     .padStart(4, "0");
   return `${safeName} ${date} ${hex}`;
+}
+
+function normalizeHostMode(value) {
+  const mode = String(value || "")
+    .trim()
+    .toLowerCase();
+  return mode === "zip" ? "zip" : "raw";
 }
 
 function sleep(ms) {
