@@ -19,7 +19,7 @@
     "bare-subprocess": "^5.2.3",
     "corestore": "^7.9.2",
     "events": "^3.3.0",
-    "flockmanager": "^1.6.1",
+    "flockmanager": "1.6.1",
     "hyperdb": "^4.8.3",
     "hyperdrive": "^13.0.1",
     "hyperswarm": "^4.17.0",

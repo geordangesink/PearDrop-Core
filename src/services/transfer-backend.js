@@ -259,7 +259,9 @@ class TransferBackend {
     const peerName = String(name || "").trim();
     this.peerProfile = peerName ? { name: peerName } : {};
     try {
-      await this.flockManager?.setUserData?.(this.peerProfile);
+      if (peerName) {
+        await this.flockManager?.setUserData?.(this.peerProfile);
+      }
     } catch {}
     return { ok: true, peerProfile: this.peerProfile };
   }
@@ -728,16 +730,18 @@ class TransferBackend {
   }
 
   async _attachFlock(roomInvite) {
-    if (this.liveFlocks.has(roomInvite)) return this.liveFlocks.get(roomInvite);
+    const room = String(roomInvite || "").trim();
+    if (!room) throw new Error("Room invite is required");
+    if (this.liveFlocks.has(room)) return this.liveFlocks.get(room);
     const flock = await this._withFlockManagerLock(async () =>
       withTimeout(
-        this.flockManager.create(roomInvite),
+        this.flockManager.create(room),
         this.flockJoinWaitMs,
         "Timed out joining transfer room",
       ),
     );
     if (!flock) throw new Error("Failed to join transfer room from invite");
-    this.liveFlocks.set(roomInvite, flock);
+    this.liveFlocks.set(room, flock);
     return flock;
   }
 
@@ -1232,6 +1236,10 @@ class TransferBackend {
   }
 
   async _createHostFlockWithDriveKey(driveKeyHex) {
+    const normalizedDriveKey = String(driveKeyHex || "").trim();
+    if (!normalizedDriveKey) {
+      throw new Error("Drive key is required for host flock");
+    }
     return this._withFlockManagerLock(async () => {
       if (!this.flockManager) {
         throw new Error("Flock manager is not ready");
@@ -1239,7 +1247,7 @@ class TransferBackend {
       let flock = null;
       try {
         flock = await this.flockManager.create();
-        await flock.set("peardrops/drive-key", driveKeyHex);
+        await flock.set("peardrops/drive-key", normalizedDriveKey);
         return flock;
       } catch (error) {
         try {
