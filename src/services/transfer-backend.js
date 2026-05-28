@@ -50,7 +50,8 @@ class TransferBackend {
     this.peerProfile = {};
     this.peerControlChannels = new Map();
     this.hostControlTopics = new Map();
-    this._hostFlockCreateLock = Promise.resolve();
+    this._flockManagerLock = Promise.resolve();
+    this._flockManagerClosing = false;
   }
 
   async ready() {
@@ -728,10 +729,12 @@ class TransferBackend {
 
   async _attachFlock(roomInvite) {
     if (this.liveFlocks.has(roomInvite)) return this.liveFlocks.get(roomInvite);
-    const flock = await withTimeout(
-      this.flockManager.create(roomInvite),
-      this.flockJoinWaitMs,
-      "Timed out joining transfer room",
+    const flock = await this._withFlockManagerLock(async () =>
+      withTimeout(
+        this.flockManager.create(roomInvite),
+        this.flockJoinWaitMs,
+        "Timed out joining transfer room",
+      ),
     );
     if (!flock) throw new Error("Failed to join transfer room from invite");
     this.liveFlocks.set(roomInvite, flock);
@@ -1132,6 +1135,7 @@ class TransferBackend {
   }
 
   async close() {
+    this._flockManagerClosing = true;
     for (const host of this.liveHosts.values()) {
       this._stopHostMemberTracking(host);
     }
@@ -1145,7 +1149,9 @@ class TransferBackend {
       await host.swarm.destroy();
     }
     this.webHosts.clear();
-    await this.flockManager?.close();
+    await this._withFlockManagerLock(async () => {
+      await this.flockManager?.close();
+    });
     for (const drive of this.liveDrives.values()) {
       await drive.close();
     }
@@ -1226,7 +1232,7 @@ class TransferBackend {
   }
 
   async _createHostFlockWithDriveKey(driveKeyHex) {
-    return this._withHostFlockCreateLock(async () => {
+    return this._withFlockManagerLock(async () => {
       if (!this.flockManager) {
         throw new Error("Flock manager is not ready");
       }
@@ -1244,10 +1250,13 @@ class TransferBackend {
     });
   }
 
-  async _withHostFlockCreateLock(task) {
-    const previous = this._hostFlockCreateLock;
+  async _withFlockManagerLock(task) {
+    if (this._flockManagerClosing) {
+      throw new Error("Flock manager is closing");
+    }
+    const previous = this._flockManagerLock;
     let release = null;
-    this._hostFlockCreateLock = new Promise((resolve) => {
+    this._flockManagerLock = new Promise((resolve) => {
       release = resolve;
     });
     await previous;
