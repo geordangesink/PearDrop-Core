@@ -46,6 +46,7 @@ class TransferBackend {
     this.hostPeerActivity = new Map();
     this.hostPeerEvents = [];
     this.hostPeerEventSeq = 0;
+    this.canceledOperations = new Set();
     this.peerProfile = {};
     this.peerControlChannels = new Map();
     this.hostControlTopics = new Map();
@@ -103,6 +104,7 @@ class TransferBackend {
     sessionName = "",
     nativeInvite = "",
     hostMode = "raw",
+    operationId = "",
   }) {
     if (!Array.isArray(files) || files.length === 0) {
       throw new Error("At least one file is required");
@@ -114,17 +116,27 @@ class TransferBackend {
     );
     await drive.ready();
 
-    const fileManifest = await this._writeFilesAndManifest({ drive, files });
-
-    const hosted = await this._startHostingDrive({
+    const opId = String(operationId || "").trim();
+    const fileManifest = await this._writeFilesAndManifest({
       drive,
-      transferId,
-      fileManifest,
-      sessionName,
-      nativeInvite,
-      hostMode,
+      files,
+      operationId: opId,
     });
-    return hosted;
+
+    try {
+      this._assertOperationNotCanceled(opId);
+      const hosted = await this._startHostingDrive({
+        drive,
+        transferId,
+        fileManifest,
+        sessionName,
+        nativeInvite,
+        hostMode,
+      });
+      return hosted;
+    } finally {
+      this._clearCanceledOperation(opId);
+    }
   }
 
   async updateActiveHost({ invite, files, sessionName = "", hostMode = "" }) {
@@ -388,7 +400,9 @@ class TransferBackend {
     forceRelay = false,
     useServer = false,
     transportMode = "",
+    operationId = "",
   }) {
+    const opId = String(operationId || "").trim();
     const parsedInvite = parseInvite(invite);
     const { driveKey, roomInvite } = parsedInvite;
     if (
@@ -415,7 +429,7 @@ class TransferBackend {
     if (roomInvite) {
       try {
         const flock = await this._attachFlock(roomInvite);
-        const fromRoom = await this._waitForFlockDriveKey(flock);
+        const fromRoom = await this._waitForFlockDriveKey(flock, opId);
         if (fromRoom) candidates.push(fromRoom);
       } catch (error) {
         console.error(
@@ -437,7 +451,7 @@ class TransferBackend {
           `[transfer-backend] trying manifest key ${String(key).slice(0, 12)}...`,
         );
         const drive = await this._attachReadableDrive(key);
-        const raw = await this._waitForEntry(drive, "/manifest.json");
+        const raw = await this._waitForEntry(drive, "/manifest.json", opId);
         return JSON.parse(raw.toString("utf8"));
       } catch (error) {
         lastError = error;
@@ -457,7 +471,9 @@ class TransferBackend {
     forceRelay = false,
     useServer = false,
     transportMode = "",
+    operationId = "",
   }) {
+    const opId = String(operationId || "").trim();
     const parsedInvite = parseInvite(invite);
     const { driveKey, roomInvite } = parsedInvite;
     if (
@@ -472,6 +488,7 @@ class TransferBackend {
           parsedInvite,
           invite,
           targetDir,
+          operationId: opId,
         });
       } catch (error) {
         console.error(
@@ -483,15 +500,17 @@ class TransferBackend {
     const resolvedDriveKey = await this._resolveDriveKey({
       driveKey,
       roomInvite,
+      operationId: opId,
     });
     const drive = await this._attachReadableDrive(resolvedDriveKey);
-    const manifest = await this.getManifest({ invite });
+    const manifest = await this.getManifest({ invite, operationId: opId });
 
     await fs.promises.mkdir(targetDir, { recursive: true });
 
     const saved = [];
     for (const entry of manifest.files) {
-      const data = await this._waitForEntry(drive, entry.drivePath);
+      this._assertOperationNotCanceled(opId);
+      const data = await this._waitForEntry(drive, entry.drivePath, opId);
       const outPath = path.join(targetDir, entry.name);
       await fs.promises.writeFile(outPath, data);
       saved.push({
@@ -509,10 +528,15 @@ class TransferBackend {
       totalBytes: saved.reduce((sum, item) => sum + item.byteLength, 0),
     });
 
-    return {
-      transfer: persisted,
-      files: saved,
-    };
+    try {
+      this._assertOperationNotCanceled(opId);
+      return {
+        transfer: persisted,
+        files: saved,
+      };
+    } finally {
+      this._clearCanceledOperation(opId);
+    }
   }
 
   async readEntry({
@@ -521,6 +545,7 @@ class TransferBackend {
     forceRelay = false,
     useServer = false,
     transportMode = "",
+    operationId = "",
   }) {
     if (!drivePath || typeof drivePath !== "string") {
       throw new Error("drivePath is required");
@@ -544,12 +569,14 @@ class TransferBackend {
         );
       }
     }
+    const opId = String(operationId || "").trim();
     const resolvedDriveKey = await this._resolveDriveKey({
       driveKey,
       roomInvite,
+      operationId: opId,
     });
     const drive = await this._attachReadableDrive(resolvedDriveKey);
-    const data = await this._waitForEntry(drive, drivePath);
+    const data = await this._waitForEntry(drive, drivePath, opId);
 
     return {
       drivePath,
@@ -566,6 +593,7 @@ class TransferBackend {
     forceRelay = false,
     useServer = false,
     transportMode = "",
+    operationId = "",
   }) {
     if (!drivePath || typeof drivePath !== "string") {
       throw new Error("drivePath is required");
@@ -594,11 +622,14 @@ class TransferBackend {
         );
       }
     }
+    const opId = String(operationId || "").trim();
     const resolvedDriveKey = await this._resolveDriveKey({
       driveKey,
       roomInvite,
+      operationId: opId,
     });
     const drive = await this._attachReadableDrive(resolvedDriveKey);
+    this._assertOperationNotCanceled(opId);
 
     const safeOffset = Math.max(0, Number(offset || 0));
     const safeLength = Math.max(1, Math.min(1024 * 1024, Number(length || 0)));
@@ -681,13 +712,13 @@ class TransferBackend {
     }
   }
 
-  async _resolveDriveKey({ driveKey, roomInvite }) {
+  async _resolveDriveKey({ driveKey, roomInvite, operationId = "" }) {
     // Prefer explicit drive keys first for stable/persistent links.
     if (driveKey) return driveKey;
 
     if (roomInvite) {
       const flock = await this._attachFlock(roomInvite);
-      const fromRoom = await this._waitForFlockDriveKey(flock);
+      const fromRoom = await this._waitForFlockDriveKey(flock, operationId);
       if (fromRoom) return fromRoom;
     }
 
@@ -706,9 +737,10 @@ class TransferBackend {
     return flock;
   }
 
-  async _waitForFlockDriveKey(flock) {
+  async _waitForFlockDriveKey(flock, operationId = "") {
     const start = Date.now();
     while (true) {
+      this._assertOperationNotCanceled(operationId);
       const value = await flock.get("peardrops/drive-key");
       const key = normalizeDriveKey(value);
       if (key) return key;
@@ -717,9 +749,10 @@ class TransferBackend {
     }
   }
 
-  async _waitForEntry(drive, drivePath) {
+  async _waitForEntry(drive, drivePath, operationId = "") {
     const start = Date.now();
     while (true) {
+      this._assertOperationNotCanceled(operationId);
       const data = await drive.get(drivePath);
       if (data) return data;
 
@@ -1018,7 +1051,7 @@ class TransferBackend {
     }
   }
 
-  async _downloadViaRelay({ parsedInvite, invite, targetDir }) {
+  async _downloadViaRelay({ parsedInvite, invite, targetDir, operationId = "" }) {
     const relay = await this._openRelayDriveSession(parsedInvite);
     try {
       const manifestResponse = await relay.request({ type: "manifest" });
@@ -1029,6 +1062,7 @@ class TransferBackend {
 
       const saved = [];
       for (const entry of files) {
+        this._assertOperationNotCanceled(operationId);
         const drivePath = String(entry?.drivePath || "");
         if (!drivePath) continue;
         const response = await relay.request({ type: "file", path: drivePath });
@@ -1058,8 +1092,30 @@ class TransferBackend {
         files: saved,
       };
     } finally {
+      this._clearCanceledOperation(operationId);
       await relay.close();
     }
+  }
+
+  cancelOperation({ operationId = "" } = {}) {
+    const opId = String(operationId || "").trim();
+    if (!opId) return { canceled: false };
+    this.canceledOperations.add(opId);
+    return { canceled: true, operationId: opId };
+  }
+
+  _assertOperationNotCanceled(operationId = "") {
+    const opId = String(operationId || "").trim();
+    if (!opId) return;
+    if (this.canceledOperations.has(opId)) {
+      throw new Error("Operation canceled");
+    }
+  }
+
+  _clearCanceledOperation(operationId = "") {
+    const opId = String(operationId || "").trim();
+    if (!opId) return;
+    this.canceledOperations.delete(opId);
   }
 
   _pruneZombieHosts() {

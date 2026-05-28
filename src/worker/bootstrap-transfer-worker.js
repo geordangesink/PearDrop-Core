@@ -148,6 +148,8 @@ async function bootstrapTransferWorker({
       guard(() => backend.reportHostPeerEvent(payload)),
     [RpcCommand.SET_PEER_PROFILE]: (payload) =>
       guard(() => backend.setPeerProfile(payload)),
+    [RpcCommand.CANCEL_OPERATION]: (payload) =>
+      guard(() => backend.cancelOperation(payload)),
   });
 
   return { backend, updaterWorker, close };

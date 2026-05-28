@@ -16,6 +16,7 @@ const RpcCommand = {
   LIST_HOST_PEER_ACTIVITY: 12,
   REPORT_HOST_PEER_EVENT: 13,
   SET_PEER_PROFILE: 14,
+  CANCEL_OPERATION: 15,
 };
 
 function createRpcServer(ipc, handlers) {
