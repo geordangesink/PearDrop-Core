@@ -50,6 +50,7 @@ class TransferBackend {
     this.peerProfile = {};
     this.peerControlChannels = new Map();
     this.hostControlTopics = new Map();
+    this._hostFlockCreateLock = Promise.resolve();
   }
 
   async ready() {
@@ -1225,31 +1226,36 @@ class TransferBackend {
   }
 
   async _createHostFlockWithDriveKey(driveKeyHex) {
-    let lastError = null;
-    for (let attempt = 0; attempt < 4; attempt++) {
+    return this._withHostFlockCreateLock(async () => {
+      if (!this.flockManager) {
+        throw new Error("Flock manager is not ready");
+      }
       let flock = null;
       try {
         flock = await this.flockManager.create();
         await flock.set("peardrops/drive-key", driveKeyHex);
         return flock;
       } catch (error) {
-        lastError = error || new Error("Failed to initialize host flock");
         try {
           await flock?.close?.();
         } catch {}
-        if (!this._isAutobaseClosingError(error) || attempt >= 3) break;
-        await sleep(120 * (attempt + 1));
+        throw error || new Error("Failed to initialize host flock");
       }
-    }
-    throw lastError || new Error("Failed to initialize host flock");
+    });
   }
 
-  _isAutobaseClosingError(error) {
-    const message = String(error?.message || error || "").toLowerCase();
-    return (
-      message.includes("autobase is closing") ||
-      message.includes("autobase closing")
-    );
+  async _withHostFlockCreateLock(task) {
+    const previous = this._hostFlockCreateLock;
+    let release = null;
+    this._hostFlockCreateLock = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await task();
+    } finally {
+      if (release) release();
+    }
   }
 
   _handleWebTransferSocket(socket, drive) {
