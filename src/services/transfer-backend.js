@@ -1139,7 +1139,6 @@ class TransferBackend {
   }
 
   async close() {
-    this._flockManagerClosing = true;
     for (const host of this.liveHosts.values()) {
       this._stopHostMemberTracking(host);
     }
@@ -1153,9 +1152,13 @@ class TransferBackend {
       await host.swarm.destroy();
     }
     this.webHosts.clear();
-    await this._withFlockManagerLock(async () => {
-      await this.flockManager?.close();
-    });
+    await this._withFlockManagerLock(
+      async () => {
+        this._flockManagerClosing = true;
+        await this.flockManager?.close();
+      },
+      { allowWhenClosing: true },
+    );
     for (const drive of this.liveDrives.values()) {
       await drive.close();
     }
@@ -1247,6 +1250,9 @@ class TransferBackend {
       let flock = null;
       try {
         flock = await this.flockManager.create();
+        if (flock?.autobee?.waitForWritable) {
+          await flock.autobee.waitForWritable();
+        }
         await flock.set("peardrops/drive-key", normalizedDriveKey);
         return flock;
       } catch (error) {
@@ -1258,8 +1264,8 @@ class TransferBackend {
     });
   }
 
-  async _withFlockManagerLock(task) {
-    if (this._flockManagerClosing) {
+  async _withFlockManagerLock(task, { allowWhenClosing = false } = {}) {
+    if (this._flockManagerClosing && !allowWhenClosing) {
       throw new Error("Flock manager is closing");
     }
     const previous = this._flockManagerLock;
