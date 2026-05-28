@@ -1,6 +1,6 @@
 {
   "name": "pear-drop-core",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "type": "commonjs",
   "main": "src/index.js",
   "scripts": {
