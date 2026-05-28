@@ -749,8 +749,7 @@ class TransferBackend {
     this.liveDrives.set(driveKeyHex, drive);
 
     const webHost = await this._createWebHostForDrive(drive);
-    const flock = await this.flockManager.create();
-    await flock.set("peardrops/drive-key", driveKeyHex);
+    const flock = await this._createHostFlockWithDriveKey(driveKeyHex);
     this.liveFlocks.set(flock.invite, flock);
 
     let parsedNativeInvite = null;
@@ -1167,6 +1166,34 @@ class TransferBackend {
       topicHex,
       hostPublicKey,
     };
+  }
+
+  async _createHostFlockWithDriveKey(driveKeyHex) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      let flock = null;
+      try {
+        flock = await this.flockManager.create();
+        await flock.set("peardrops/drive-key", driveKeyHex);
+        return flock;
+      } catch (error) {
+        lastError = error || new Error("Failed to initialize host flock");
+        try {
+          await flock?.close?.();
+        } catch {}
+        if (!this._isAutobaseClosingError(error) || attempt >= 3) break;
+        await sleep(120 * (attempt + 1));
+      }
+    }
+    throw lastError || new Error("Failed to initialize host flock");
+  }
+
+  _isAutobaseClosingError(error) {
+    const message = String(error?.message || error || "").toLowerCase();
+    return (
+      message.includes("autobase is closing") ||
+      message.includes("autobase closing")
+    );
   }
 
   _handleWebTransferSocket(socket, drive) {
