@@ -6,6 +6,7 @@ function createInvite({
   topic = "",
   relayUrl = "",
   webKey = "",
+  pushTarget = "",
   app = "native",
 }) {
   if (!driveKey && !roomInvite && !topic && !webKey) {
@@ -17,6 +18,7 @@ function createInvite({
   if (topic) url.searchParams.set("topic", String(topic));
   if (relayUrl) url.searchParams.set("relay", relayUrl);
   if (webKey) url.searchParams.set("web", String(webKey));
+  if (pushTarget) url.searchParams.set("push", String(pushTarget));
   url.searchParams.set("app", app);
   return url.toString();
 }
@@ -39,6 +41,7 @@ function parseInvite(value) {
     topic: url.searchParams.get("topic") || "",
     relayUrl: url.searchParams.get("relay") || "",
     webKey: url.searchParams.get("web") || "",
+    pushTarget: url.searchParams.get("push") || "",
     app: url.searchParams.get("app") || "native",
   };
 }

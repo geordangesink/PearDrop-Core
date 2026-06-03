@@ -52,6 +52,7 @@ class TransferBackend {
     this.hostControlTopics = new Map();
     this._flockManagerLock = Promise.resolve();
     this._flockManagerClosing = false;
+    this.joinPushDedup = new Map();
   }
 
   async ready() {
@@ -106,6 +107,7 @@ class TransferBackend {
     sessionName = "",
     nativeInvite = "",
     hostMode = "raw",
+    pushTarget = "",
     operationId = "",
   }) {
     if (!Array.isArray(files) || files.length === 0) {
@@ -134,6 +136,7 @@ class TransferBackend {
         sessionName,
         nativeInvite,
         hostMode,
+        pushTarget,
       });
       return hosted;
     } finally {
@@ -325,7 +328,12 @@ class TransferBackend {
     };
   }
 
-  async startHostFromTransfer({ transferId, sessionName = "", hostMode = "" }) {
+  async startHostFromTransfer({
+    transferId,
+    sessionName = "",
+    hostMode = "",
+    pushTarget = "",
+  }) {
     const normalizedTransferId = String(transferId || "").trim();
     const transfer =
       await this._resolveTransferForRestart(normalizedTransferId);
@@ -378,6 +386,7 @@ class TransferBackend {
       sessionLabel: reusedSessionLabel,
       hostMode: reusedHostMode,
       nativeInvite: transfer.invite,
+      pushTarget,
       persistTransfer: false,
       existingTransfer: transfer,
     });
@@ -779,6 +788,7 @@ class TransferBackend {
     sessionLabel = "",
     hostMode = "raw",
     nativeInvite = "",
+    pushTarget = "",
     persistTransfer = true,
     existingTransfer = null,
   }) {
@@ -833,6 +843,7 @@ class TransferBackend {
       topic: topicForLinks,
       webKey: webKeyForLinks,
       relayUrl: relayForLinks,
+      pushTarget: String(pushTarget || parsedNativeInvite?.pushTarget || "").trim(),
       app: inviteApp,
     });
 
@@ -1785,6 +1796,17 @@ class TransferBackend {
       peerName: String(peerName || this.peerProfile?.name || "").trim(),
       progress: Number(progress),
     };
+    const normalizedType = String(type || "").toLowerCase();
+    if (["joined", "started", "downloading"].includes(normalizedType)) {
+      void this._notifyJoinRequestPush({
+        parsedInvite,
+        invite,
+        sessionName,
+        peerName,
+        peerKeyHex:
+          stablePeerKeyHex || safeHex(peerKeyHex) || String(peerName || ""),
+      });
+    }
     const message = b4a.from(`${JSON.stringify(payload)}\n`, "utf8");
     if (channel.sockets.size === 0) {
       channel.pending.push(message);
@@ -1797,6 +1819,73 @@ class TransferBackend {
       try {
         socket.write(message);
       } catch {}
+    }
+  }
+
+  async _notifyJoinRequestPush({
+    parsedInvite = null,
+    invite = "",
+    sessionName = "",
+    peerName = "",
+    peerKeyHex = "",
+  } = {}) {
+    try {
+      const pushTarget = String(parsedInvite?.pushTarget || "").trim();
+      if (!pushTarget) return;
+      const dedupeKey = [
+        pushTarget,
+        String(invite || "").trim(),
+        String(peerKeyHex || "").trim(),
+      ].join("|");
+      const now = Date.now();
+      const lastSentAt = Number(this.joinPushDedup.get(dedupeKey) || 0);
+      if (lastSentAt && now - lastSentAt < 30_000) return;
+      this.joinPushDedup.set(dedupeKey, now);
+      if (this.joinPushDedup.size > 2000) {
+        const oldest = Array.from(this.joinPushDedup.entries()).sort(
+          (a, b) => Number(a[1] || 0) - Number(b[1] || 0),
+        );
+        for (let i = 0; i < oldest.length - 1500; i++) {
+          this.joinPushDedup.delete(oldest[i][0]);
+        }
+      }
+      const relayUrl = this._resolveRelayUrl(parsedInvite);
+      const endpoint = relayWsToHttp(relayUrl, "/push/join-request");
+      if (!endpoint || typeof fetch !== "function") return;
+      let delivered = false;
+      let lastStatus = 0;
+      let lastMessage = "";
+      for (let i = 0; i < 3; i++) {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            pushTarget,
+            invite: String(invite || ""),
+            sessionName: String(sessionName || "").trim() || "Host Session",
+            peerName: String(peerName || "").trim(),
+          }),
+        });
+        if (response.ok) {
+          delivered = true;
+          break;
+        }
+        lastStatus = Number(response.status || 0);
+        lastMessage = await response.text().catch(() => "");
+        if (i < 2) await sleep(220 * (i + 1));
+      }
+      if (!delivered) {
+        console.warn(
+          "[transfer-backend] join push notify failed:",
+          lastStatus,
+          lastMessage || "request failed",
+        );
+      }
+    } catch (error) {
+      console.warn(
+        "[transfer-backend] join push notify error:",
+        String(error?.message || error || "unknown error"),
+      );
     }
   }
 
@@ -1881,6 +1970,16 @@ class TransferBackend {
       status: "joined",
       progress: 0,
     });
+    try {
+      const parsedInvite = parseInvite(String(host.invite || "").trim());
+      void this._notifyJoinRequestPush({
+        parsedInvite,
+        invite: host.invite,
+        sessionName: host.sessionName,
+        peerName,
+        peerKeyHex,
+      });
+    } catch {}
   }
 
   _handleHostPeerLeft(host, peerId) {
@@ -2125,6 +2224,20 @@ async function readUploadFile(sourcePath) {
 
 function randomId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function relayWsToHttp(relayUrl, pathName) {
+  try {
+    const ws = new URL(String(relayUrl || "").trim());
+    if (!ws.protocol.startsWith("ws")) return "";
+    ws.protocol = ws.protocol === "wss:" ? "https:" : "http:";
+    ws.pathname = String(pathName || "/");
+    ws.search = "";
+    ws.hash = "";
+    return ws.toString();
+  } catch {
+    return "";
+  }
 }
 
 function deriveWebTopic(discoveryKey) {
